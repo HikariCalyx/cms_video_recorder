@@ -13,6 +13,9 @@ dirs = "6.0.0"
 # `iced::time::every` resolves to a no-op stream and the recording
 # countdown would never tick.
 iced = { version = "0.13", features = ["image", "tokio"] }
+# Settings persistence: %APPDATA%\cms_video_recorder\config.json
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
 
 [target.'cfg(windows)'.dependencies]
 # Windows.Graphics.Capture + Media Foundation encoder, used by the recorder.
@@ -32,6 +35,10 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
+    # RegisterHotKey, for the system-wide record/stop shortcut
+    "Win32_UI_Input_KeyboardAndMouse",
+    # IFileOpenDialog in folder-picking mode, for choosing the output directory
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

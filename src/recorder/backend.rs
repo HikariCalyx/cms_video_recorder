@@ -594,7 +594,12 @@ impl GraphicsCaptureApiHandler for Session {
         // Enforce the cap here as well as in the UI. The UI stop is what the
         // user sees, but closing the file on this side guarantees the
         // recording never runs long even if the UI is busy or wedged.
-        if start.elapsed() >= self.flags.config.max_duration {
+        if self
+            .flags
+            .config
+            .max_duration
+            .is_some_and(|max| start.elapsed() >= max)
+        {
             self.close()?;
             capture_control.stop();
         }

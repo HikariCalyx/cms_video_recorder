@@ -7,12 +7,18 @@ use std::time::{Duration, Instant};
 use iced::{
     font::{Family, Weight},
     futures::channel::oneshot,
-    widget::{button, column, container, horizontal_space, image, mouse_area, row, scrollable, text},
+    keyboard,
+    widget::{
+        button, column, container, horizontal_space, image, mouse_area, row, scrollable, text,
+        text_input,
+    },
     window, Alignment, Background, Border, Color, Element, Font, Length, Shadow, Size, Subscription,
     Task, Theme,
 };
 
-use crate::recorder::{self, RecorderConfig, Recording};
+use crate::config::AppConfig;
+use crate::recorder::{self, Recording};
+use crate::settings::{self, Capture, SettingsState};
 use crate::window_picker::{WindowInfo, WindowPickerState};
 
 /// Default UI font – Microsoft YaHei UI ships with Windows and covers both
@@ -52,6 +58,11 @@ pub const WINDOW_WIDTH: f32 = 460.0;
 pub const BAR_HEIGHT: f32 = 52.0;
 /// Height when the picker panel is expanded
 pub const EXPANDED_HEIGHT: f32 = 320.0;
+/// Height when the settings panel is expanded.
+///
+/// Sized to the form's natural height – the panel doesn't scroll, so anything
+/// shorter squeezes the fields.
+pub const SETTINGS_HEIGHT: f32 = 284.0;
 
 // --- Timing ----------------------------------------------------------------
 
@@ -98,6 +109,26 @@ pub enum Message {
     Tick,
     /// The encoder finished writing the file (or failed trying)
     RecordingFinished(Result<PathBuf, recorder::Error>),
+    /// Expand / collapse the settings panel
+    ToggleSettings,
+    /// The output directory field was edited
+    OutputDirChanged(String),
+    /// The duration-cap field was edited
+    MaxDurationChanged(String),
+    /// Open the folder picker
+    BrowseOutputDir,
+    /// The folder picker closed, with a folder or without one
+    OutputDirPicked(Option<PathBuf>),
+    /// Start reading the next key press as the new shortcut
+    CaptureHotkey,
+    /// A key press arrived while the shortcut was being read
+    HotkeyCaptured(keyboard::Key, keyboard::Modifiers),
+    /// Unassign the shortcut
+    ClearHotkey,
+    /// The global shortcut fired, or couldn't be registered
+    Hotkey(crate::hotkey::Event),
+    /// Write the edited settings to disk
+    SaveSettings,
     /// Close the application
     Close,
 }
@@ -117,10 +148,10 @@ enum Status {
 pub struct Toolbar {
     pub picker: WindowPickerState,
     pub window_id: Option<window::Id>,
-    /// Output directory, duration cap and encoder settings.
-    ///
-    /// Defaults for now; a settings panel can replace this wholesale later.
-    pub config: RecorderConfig,
+    /// Persisted preferences: output directory, duration cap and shortcut.
+    pub config: AppConfig,
+    /// The settings panel and its edit buffers.
+    pub settings: SettingsState,
     /// The live capture session, if any.
     recording: Option<Recording>,
     /// True while the encoder is spinning up, before capture begins.
@@ -138,6 +169,23 @@ pub struct Toolbar {
 }
 
 impl Toolbar {
+    /// Builds the initial state from the config file.
+    pub fn new() -> (Self, Task<Message>) {
+        let config = AppConfig::load();
+
+        let mut toolbar = Self {
+            config,
+            ..Self::default()
+        };
+        toolbar.settings.reset(&toolbar.config);
+
+        // The listener thread reads this when the subscription first builds it,
+        // so the shortcut is live before the window even appears.
+        crate::hotkey::apply(toolbar.config.hotkey);
+
+        (toolbar, Task::none())
+    }
+
     // -----------------------------------------------------------------------
     // Subscription
     // -----------------------------------------------------------------------
@@ -147,12 +195,22 @@ impl Toolbar {
             // Reapplying the clip region on resize is more reliable than
             // chaining it after the resize task, which can race the OS.
             window::resize_events().map(|_| Message::WindowResized),
+            // The global shortcut, which has to work while the game has focus.
+            Subscription::run(crate::hotkey::listen).map(Message::Hotkey),
         ];
 
         // Only run the clock when something on screen depends on it, so an
         // idle toolbar doesn't redraw at all.
         if self.recording.is_some() || self.status.is_some() {
             subscriptions.push(iced::time::every(TICK_INTERVAL).map(|_| Message::Tick));
+        }
+
+        // Reading the next key press only makes sense while the hotkey field is
+        // armed, and this must not steal keys from the text inputs otherwise.
+        if self.settings.capturing {
+            subscriptions.push(keyboard::on_key_press(|key, modifiers| {
+                Some(Message::HotkeyCaptured(key, modifiers))
+            }));
         }
 
         Subscription::batch(subscriptions)
@@ -166,6 +224,8 @@ impl Toolbar {
 
         let height = if self.picker.is_open {
             EXPANDED_HEIGHT
+        } else if self.settings.is_open {
+            SETTINGS_HEIGHT
         } else {
             BAR_HEIGHT
         };
@@ -188,17 +248,22 @@ impl Toolbar {
         Task::none()
     }
 
-    /// Seconds left on the clock, rounded up.
+    /// The clock on the Stop button: time left when there's a cap, time spent
+    /// when there isn't.
     ///
-    /// Rounding up means the countdown reads the full budget the instant
-    /// recording starts and only reaches zero once the time is actually gone.
-    fn remaining_secs(&self) -> u64 {
+    /// The countdown rounds up, so it reads the full budget the instant
+    /// recording starts and only reaches zero once the time is really gone.
+    fn recording_clock(&self) -> String {
         let Some(recording) = &self.recording else {
-            return 0;
+            return clock(0);
         };
 
-        let remaining = self.config.max_duration.saturating_sub(recording.elapsed());
-        remaining.as_millis().div_ceil(1000) as u64
+        let elapsed = recording.elapsed();
+
+        match self.config.max_duration() {
+            Some(max) => clock(max.saturating_sub(elapsed).as_millis().div_ceil(1000) as u64),
+            None => clock(elapsed.as_secs()),
+        }
     }
 
     fn set_status(&mut self, status: Status) {
@@ -213,6 +278,9 @@ impl Toolbar {
     /// responsive through the wait.
     fn start_recording(&mut self) -> Task<Message> {
         let Some(target) = self.picker.selected.as_ref() else {
+            // Reachable from the hotkey, which doesn't know the Record button
+            // is disabled.
+            self.set_status(Status::Failed("请先选择窗口".to_string()));
             return Task::none();
         };
 
@@ -220,7 +288,7 @@ impl Toolbar {
         self.starting = true;
 
         let (hwnd, alias) = (target.hwnd, target.alias);
-        let config = self.config.clone();
+        let config = self.config.recorder_config();
         let slot = self.pending.clone();
 
         let (sender, receiver) = oneshot::channel();
@@ -270,6 +338,53 @@ impl Toolbar {
         )
     }
 
+    /// Adopts whatever is in the settings fields, re-registers the shortcut if
+    /// it changed, and writes the config file.
+    ///
+    /// Called when a setting is confirmed rather than on every keystroke, so a
+    /// half-typed number never becomes a real limit and the file isn't
+    /// rewritten per character.
+    fn commit_settings(&mut self) -> Task<Message> {
+        let updated = self.settings.to_config();
+
+        // Show what was actually stored: a blank path resolves to the default
+        // output directory, and a blank duration to "no limit".
+        self.settings.output_dir = updated.output_dir.to_string_lossy().into_owned();
+        self.settings.max_duration = updated.max_duration_secs.to_string();
+
+        if updated == self.config {
+            return Task::none();
+        }
+
+        let rebind = updated.hotkey != self.config.hotkey;
+        self.config = updated;
+
+        if rebind {
+            crate::hotkey::apply(self.config.hotkey);
+        }
+
+        if let Err(error) = self.config.save() {
+            self.set_status(Status::Failed(format!("设置未保存: {error}")));
+        }
+
+        Task::none()
+    }
+
+    /// Collapses the settings panel, committing what's in the fields.
+    ///
+    /// Does not resize the window – callers batch that in themselves, since
+    /// they may be opening the other panel in the same update.
+    fn close_settings(&mut self) -> Task<Message> {
+        if !self.settings.is_open {
+            return Task::none();
+        }
+
+        self.settings.is_open = false;
+        self.settings.capturing = false;
+
+        self.commit_settings()
+    }
+
     /// Rebuild the rounded clip region for the current window size
     fn refresh_clip_region(&self) -> Task<Message> {
         #[cfg(windows)]
@@ -301,7 +416,16 @@ impl Toolbar {
             Message::ToggleWindowPicker => {
                 // toggle() refreshes on open, which may drop a closed window.
                 self.picker.toggle();
+
+                // Only one panel fits in the window at a time.
+                let settings = if self.picker.is_open {
+                    self.close_settings()
+                } else {
+                    Task::none()
+                };
+
                 return Task::batch([
+                    settings,
                     self.stop_recording_without_target(),
                     self.sync_window_size(),
                 ]);
@@ -373,8 +497,9 @@ impl Toolbar {
                 // makes the UI agree with it. Losing the target window ends
                 // the recording too, otherwise the countdown would keep
                 // running against a file that's already closed.
+                let cap = self.config.max_duration();
                 if self.recording.as_ref().is_some_and(|recording| {
-                    recording.elapsed() >= self.config.max_duration
+                    cap.is_some_and(|max| recording.elapsed() >= max)
                         || !recording.target_is_alive()
                 }) {
                     return self.stop_recording();
@@ -387,6 +512,107 @@ impl Toolbar {
                     Err(error) => Status::Failed(error.to_string()),
                 });
             }
+            Message::ToggleSettings => {
+                if self.settings.is_open {
+                    return Task::batch([self.close_settings(), self.sync_window_size()]);
+                }
+
+                self.settings.is_open = true;
+                // Discard anything left over from a panel that was closed
+                // without saving.
+                self.settings.reset(&self.config);
+
+                // Both panels share the window body.
+                if self.picker.is_open {
+                    self.picker.is_open = false;
+                }
+
+                return self.sync_window_size();
+            }
+            Message::OutputDirChanged(value) => {
+                self.settings.output_dir = value;
+            }
+            Message::MaxDurationChanged(value) => {
+                // Digits only, so the field can never hold something that
+                // silently parses to "no limit".
+                self.settings.max_duration = value.chars().filter(char::is_ascii_digit).collect();
+            }
+            Message::BrowseOutputDir => {
+                if self.settings.browsing {
+                    return Task::none();
+                }
+
+                self.settings.browsing = true;
+
+                // The shell dialog is modal and runs its own message pump, so
+                // it goes on a thread of its own rather than blocking the UI.
+                let start = PathBuf::from(self.settings.output_dir.trim());
+                let (sender, receiver) = oneshot::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(crate::dialog::pick_folder(&start));
+                });
+
+                return Task::perform(
+                    async move { receiver.await.unwrap_or(None) },
+                    Message::OutputDirPicked,
+                );
+            }
+            Message::OutputDirPicked(picked) => {
+                self.settings.browsing = false;
+
+                if let Some(dir) = picked {
+                    self.settings.output_dir = dir.to_string_lossy().into_owned();
+                    return self.commit_settings();
+                }
+            }
+            Message::CaptureHotkey => {
+                self.settings.capturing = !self.settings.capturing;
+            }
+            Message::ClearHotkey => {
+                self.settings.capturing = false;
+                self.settings.hotkey = None;
+                return self.commit_settings();
+            }
+            Message::HotkeyCaptured(key, modifiers) => {
+                if !self.settings.capturing {
+                    return Task::none();
+                }
+
+                match settings::capture(&key, modifiers) {
+                    Capture::Bound(hotkey) => {
+                        self.settings.capturing = false;
+                        self.settings.hotkey = Some(hotkey);
+                        return self.commit_settings();
+                    }
+                    Capture::Cleared => {
+                        self.settings.capturing = false;
+                        self.settings.hotkey = None;
+                        return self.commit_settings();
+                    }
+                    Capture::Cancelled => self.settings.capturing = false,
+                    // A modifier on its own, or a key that can't be bound.
+                    Capture::Ignored => {}
+                }
+            }
+            Message::SaveSettings => {
+                // Closing is what commits, so this is the same path as pressing
+                // the cog again – it just reads as a confirmation.
+                return Task::batch([self.close_settings(), self.sync_window_size()]);
+            }
+            Message::Hotkey(event) => match event {
+                crate::hotkey::Event::Pressed => {
+                    return self.update(Message::ToggleRecording);
+                }
+                crate::hotkey::Event::Rejected => {
+                    // Naming the combination is the whole point of the message:
+                    // it tells the user which one to change.
+                    let combination = match self.config.hotkey {
+                        Some(hotkey) => hotkey.label(),
+                        None => "快捷键".to_string(),
+                    };
+                    self.set_status(Status::Failed(format!("{combination} 已被占用")));
+                }
+            },
             Message::Close => {
                 if let Some(id) = self.window_id {
                     return window::close(id);
@@ -402,15 +628,22 @@ impl Toolbar {
     pub fn view(&self) -> Element<'_, Message> {
         let bar = self.toolbar_row();
 
-        let body: Element<Message> = if self.picker.is_open {
-            column![
+        let panel: Option<Element<Message>> = if self.picker.is_open {
+            Some(self.picker_panel())
+        } else if self.settings.is_open {
+            Some(self.settings_panel())
+        } else {
+            None
+        };
+
+        let body: Element<Message> = match panel {
+            Some(panel) => column![
                 container(bar).height(Length::Fixed(BAR_HEIGHT)),
                 separator(),
-                self.picker_panel(),
+                panel,
             ]
-            .into()
-        } else {
-            container(bar).height(Length::Fill).into()
+            .into(),
+            None => container(bar).height(Length::Fill).into(),
         };
 
         // The pill fills the entire window; the OS clips the rounded corners.
@@ -482,7 +715,7 @@ impl Toolbar {
             // the button doesn't twitch as the countdown crosses ten seconds.
             (
                 stop_square(),
-                format!("停止 {:02}s", self.remaining_secs()),
+                format!("停止 {}", self.recording_clock()),
                 record_active_style,
             )
         } else {
@@ -515,6 +748,23 @@ impl Toolbar {
         .padding([0, 14])
         .height(32);
 
+        // --- Settings button ---
+        let settings_btn = button(
+            container(process_icon(&crate::cog::handle(), 15))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center(Length::Fill),
+        )
+        .style(if self.settings.is_open {
+            icon_btn_active_style
+        } else {
+            icon_btn_style
+        })
+        .on_press(Message::ToggleSettings)
+        .padding(0)
+        .width(28)
+        .height(28);
+
         // --- Close button ---
         let close_btn = button(
             text("\u{00D7}")
@@ -541,7 +791,7 @@ impl Toolbar {
         )
         .on_press(Message::StartDrag);
 
-        row![grip, window_btn, record_btn, filler, close_btn]
+        row![grip, window_btn, record_btn, filler, settings_btn, close_btn]
             .spacing(8)
             .align_y(Alignment::Center)
             .padding([0, 10])
@@ -658,6 +908,144 @@ impl Toolbar {
             .into()
     }
 
+    /// The expandable settings form
+    fn settings_panel(&self) -> Element<'_, Message> {
+        let header = row![
+            text("设置")
+                .size(11)
+                .font(UI_FONT_BOLD)
+                .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
+            horizontal_space(),
+            small_button("完成", Message::SaveSettings),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // --- Output directory ---
+        let path_row = row![
+            text_input("保存位置", &self.settings.output_dir)
+                .on_input(Message::OutputDirChanged)
+                .on_submit(Message::SaveSettings)
+                .style(field_style)
+                .size(12)
+                .padding([6, 8])
+                .width(Length::Fill),
+            small_button("浏览…", Message::BrowseOutputDir),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // --- Duration cap ---
+        let duration_row = row![
+            text_input("0", &self.settings.max_duration)
+                .on_input(Message::MaxDurationChanged)
+                .on_submit(Message::SaveSettings)
+                .style(field_style)
+                .size(12)
+                .padding([6, 8])
+                .width(Length::Fixed(72.0)),
+            text(match self.config.max_duration() {
+                Some(_) => "秒后自动停止".to_string(),
+                None => "秒，0 表示不限时长".to_string(),
+            })
+            .size(11)
+            .color(Color::from_rgb8(0x7E, 0x7E, 0x8A)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        // --- Hotkey ---
+        // The binding is shown as key caps rather than as the label of the
+        // button that changes it, so what's assigned reads as a fact about the
+        // app and stays legible while the field is armed.
+        let mut hotkey_row = row![self.hotkey_display()]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .push(horizontal_space())
+            .push(small_button(
+                if self.settings.capturing {
+                    "取消"
+                } else {
+                    "修改"
+                },
+                Message::CaptureHotkey,
+            ));
+
+        if self.settings.hotkey.is_some() && !self.settings.capturing {
+            hotkey_row = hotkey_row.push(small_button("清除", Message::ClearHotkey));
+        }
+
+        let hotkey_hint = text(if self.settings.capturing {
+            "按下新的组合键；Esc 取消，Backspace 清除"
+        } else {
+            "全局有效，游戏窗口在前台也能触发"
+        })
+        .size(10)
+        .color(Color::from_rgb8(0x7E, 0x7E, 0x8A))
+        .wrapping(text::Wrapping::None);
+
+        let panel = column![
+            header,
+            field_label("保存位置"),
+            path_row,
+            field_label("最长录制时间"),
+            duration_row,
+            field_label("录制 / 停止快捷键"),
+            hotkey_row,
+            hotkey_hint,
+            horizontal_space(),
+            text(format!("配置文件: {}", crate::config::config_dir_display()))
+                .size(9)
+                .color(Color::from_rgb8(0x60, 0x60, 0x6C))
+                .wrapping(text::Wrapping::None),
+        ]
+        .spacing(5)
+        .padding([8, 12]);
+
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// The assigned shortcut, as one cap per key.
+    ///
+    /// Stays on screen while the field is armed – the caps just dim – so the
+    /// user can see what they're about to replace.
+    fn hotkey_display(&self) -> Element<'_, Message> {
+        let Some(hotkey) = self.settings.hotkey else {
+            let (label, color) = if self.settings.capturing {
+                ("等待按键…", Color::from_rgb8(0x9C, 0xB8, 0xF0))
+            } else {
+                ("未设置", Color::from_rgb8(0x7E, 0x7E, 0x8A))
+            };
+
+            return text(label)
+                .size(12)
+                .color(color)
+                // Matches a cap, so the row doesn't change height when the
+                // shortcut is cleared.
+                .height(Length::Fixed(KEY_CAP_HEIGHT))
+                .align_y(iced::alignment::Vertical::Center)
+                .into();
+        };
+
+        let mut caps = row![].spacing(4).align_y(Alignment::Center);
+
+        for (index, part) in hotkey.parts().iter().enumerate() {
+            if index > 0 {
+                caps = caps.push(
+                    text("+")
+                        .size(10)
+                        .color(Color::from_rgb8(0x6E, 0x6E, 0x7A)),
+                );
+            }
+            caps = caps.push(key_cap(part, self.settings.capturing));
+        }
+
+        caps.into()
+    }
+
     // -----------------------------------------------------------------------
     // Theme
     // -----------------------------------------------------------------------
@@ -695,6 +1083,70 @@ fn small_button(label: &str, msg: Message) -> Element<'_, Message> {
         .on_press(msg)
         .padding([4, 9])
         .into()
+}
+
+/// Caption above a settings field.
+fn field_label<'a>(label: &'a str) -> Element<'a, Message> {
+    text(label)
+        .size(10)
+        .color(Color::from_rgb8(0x8A, 0x8A, 0x96))
+        .into()
+}
+
+/// Height of a key cap, also used by the "not set" placeholder.
+const KEY_CAP_HEIGHT: f32 = 22.0;
+
+/// One key of a shortcut, drawn as a keyboard cap.
+///
+/// `dimmed` is set while a replacement is being read, so the outgoing binding
+/// stays readable without looking current.
+fn key_cap<'a>(label: &str, dimmed: bool) -> Element<'a, Message> {
+    let (fill, edge, ink) = if dimmed {
+        (
+            Color::from_rgb8(0x26, 0x26, 0x2D),
+            Color::from_rgb8(0x38, 0x38, 0x42),
+            Color::from_rgb8(0x76, 0x76, 0x82),
+        )
+    } else {
+        (
+            Color::from_rgb8(0x33, 0x33, 0x3D),
+            Color::from_rgb8(0x4C, 0x4C, 0x5A),
+            Color::from_rgb8(0xEC, 0xEC, 0xF2),
+        )
+    };
+
+    container(
+        text(label.to_string())
+            .size(11)
+            .font(UI_FONT_BOLD)
+            .color(ink)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding([0, 7])
+    .height(Length::Fixed(KEY_CAP_HEIGHT))
+    .align_y(iced::alignment::Vertical::Center)
+    .style(move |_: &Theme| container::Style {
+        background: Some(Background::Color(fill)),
+        border: Border {
+            color: edge,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The recording clock, as `05s` under a minute and `01:05` above it.
+///
+/// Two digits either way, so the Stop button doesn't twitch as the number
+/// crosses ten seconds.
+fn clock(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs:02}s")
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
 }
 
 /// A process icon at a fixed square size.
@@ -882,6 +1334,48 @@ fn close_btn_style(_theme: &Theme, status: button::Status) -> button::Style {
             Color::from_rgb8(0x30, 0x30, 0x38),
             Color::from_rgb8(0xC8, 0xC8, 0xD0),
         )
+    }
+}
+
+/// Circular icon button in the toolbar strip, e.g. the settings cog
+fn icon_btn_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = if is_active(status) {
+        Color::from_rgb8(0x3C, 0x3C, 0x46)
+    } else {
+        Color::from_rgb8(0x2A, 0x2A, 0x32)
+    };
+    rounded(14.0, bg, Color::from_rgb8(0xDC, 0xDC, 0xE4))
+}
+
+/// Highlighted while the settings panel is expanded
+fn icon_btn_active_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = if is_active(status) {
+        Color::from_rgb8(0x4A, 0x4A, 0x58)
+    } else {
+        Color::from_rgb8(0x42, 0x42, 0x4E)
+    };
+    rounded(14.0, bg, Color::WHITE)
+}
+
+/// Text field in the settings panel
+fn field_style(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let border_color = match status {
+        text_input::Status::Focused => Color::from_rgb8(0x3D, 0x74, 0xE8),
+        text_input::Status::Hovered => Color::from_rgb8(0x4A, 0x4A, 0x58),
+        _ => Color::from_rgb8(0x3A, 0x3A, 0x42),
+    };
+
+    text_input::Style {
+        background: Background::Color(Color::from_rgb8(0x24, 0x24, 0x2B)),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        icon: Color::from_rgb8(0x8A, 0x8A, 0x96),
+        placeholder: Color::from_rgb8(0x6A, 0x6A, 0x76),
+        value: Color::from_rgb8(0xE6, 0xE6, 0xEA),
+        selection: Color::from_rgb8(0x2F, 0x62, 0xD4),
     }
 }
 

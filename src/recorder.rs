@@ -12,7 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Hard ceiling on a single recording.
+/// Default ceiling on a single recording, until the settings panel says
+/// otherwise.
 ///
 /// Also drives the countdown on the Stop button, so the number the user sees
 /// and the number the encoder enforces can't drift apart.
@@ -27,14 +28,15 @@ const OUTPUT_SUBDIR: &str = "cms_video_recorder";
 
 /// Recording settings.
 ///
-/// Currently built from `Default` at startup; the fields exist so a settings
-/// panel can override them later without touching the capture code.
+/// The output directory and duration cap come from the settings panel by way of
+/// `AppConfig`; everything else is still taken from `Default`.
 #[derive(Debug, Clone)]
 pub struct RecorderConfig {
     /// Directory the MP4 files are written to. Created on demand.
     pub output_dir: PathBuf,
-    /// Recording stops automatically after this long.
-    pub max_duration: Duration,
+    /// Recording stops automatically after this long. `None` runs until the
+    /// user stops it.
+    pub max_duration: Option<Duration>,
     /// Encoder frame rate hint, in frames per second.
     pub frame_rate: u32,
     /// Target video bitrate, in bits per second.
@@ -81,7 +83,7 @@ impl Default for RecorderConfig {
     fn default() -> Self {
         Self {
             output_dir: default_output_dir(),
-            max_duration: MAX_DURATION,
+            max_duration: Some(MAX_DURATION),
             frame_rate: 60,
             // ~12 Mbps is plenty for a game window at 1080p60 and keeps a
             // 30 second clip under about 45 MB.

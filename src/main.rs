@@ -3,9 +3,14 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cog;
+mod config;
+mod dialog;
+mod hotkey;
 #[cfg(windows)]
 mod icon;
 mod recorder;
+mod settings;
 mod toolbar;
 #[cfg(windows)]
 mod win32;
@@ -52,5 +57,7 @@ fn main() -> iced::Result {
             background_color: toolbar::pill_bg(),
             text_color: Color::WHITE,
         })
-        .run()
+        // Not `run()`: the initial state comes from the config file, so it
+        // can't be built by `Default`.
+        .run_with(Toolbar::new)
 }
