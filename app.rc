@@ -1,0 +1,58 @@
+// app.rc – Win32 resource script, compiled into the executable by build.rs.
+//
+// Constants are spelled out numerically instead of pulling in <windows.h> so
+// the script also compiles with llvm-rc / windres, not just the MSVC rc.exe.
+
+// ---------------------------------------------------------------------------
+// Application icon
+//
+// Explorer, the taskbar and Alt-Tab show the lowest-numbered ICON resource,
+// so keep this one at ID 1. Paths are relative to this file.
+// ---------------------------------------------------------------------------
+1 ICON "src/icon.ico"
+
+// ---------------------------------------------------------------------------
+// File properties – right-click the .exe → Properties → Details
+//
+// Fill in the strings below. Two rules worth remembering:
+//   * FILEVERSION / PRODUCTVERSION are four comma-separated 16-bit numbers and
+//     are what Windows actually compares; the "FileVersion" / "ProductVersion"
+//     strings are free-form display text. Keep them in sync with each other
+//     and with `version` in Cargo.toml.
+//   * Only a fixed set of VALUE names is recognised. The useful ones are all
+//     listed here; delete a line rather than leaving it blank if you don't
+//     want the property to show up. Custom names are allowed but most tools
+//     ignore them.
+// ---------------------------------------------------------------------------
+1 VERSIONINFO
+FILEVERSION    0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK  0x3FL      // VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0x0L       // 0x1L = VS_FF_DEBUG, 0x2L = VS_FF_PRERELEASE
+FILEOS         0x40004L   // VOS_NT_WINDOWS32
+FILETYPE       0x1L       // VFT_APP
+FILESUBTYPE    0x0L       // VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = en-US, 04B0 = Unicode. If you translate these strings,
+        // add a second BLOCK and list its language in VarFileInfo below.
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Hikari Calyx Tech"
+            VALUE "FileDescription",  "CMS Video Recorder"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "cms_video_recorder"
+            VALUE "LegalCopyright",   "Hikari Calyx Tech"
+            VALUE "LegalTrademarks",  "Hikari Calyx Tech"
+            VALUE "OriginalFilename", "cms_video_recorder.exe"
+            VALUE "ProductName",      "CMS Video Recorder"
+            VALUE "ProductVersion",   "0.1.0.0"
+            VALUE "Comments",         ""
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x04B0
+    END
+END

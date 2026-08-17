@@ -1,6 +1,7 @@
 // toolbar.rs – main floating toolbar state and view
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::{
@@ -91,6 +92,8 @@ pub enum Message {
     ClearSelection,
     /// Toggle recording on / off
     ToggleRecording,
+    /// The encoder is up and capture has begun (or failed to)
+    RecordingStarted(Result<(), recorder::Error>),
     /// Countdown / status-expiry clock
     Tick,
     /// The encoder finished writing the file (or failed trying)
@@ -120,6 +123,14 @@ pub struct Toolbar {
     pub config: RecorderConfig,
     /// The live capture session, if any.
     recording: Option<Recording>,
+    /// True while the encoder is spinning up, before capture begins.
+    starting: bool,
+    /// Hand-off slot for the session being started on a background thread.
+    ///
+    /// A `Recording` can't travel inside a `Message`, which has to stay
+    /// `Clone`, so the worker parks it here and the message just signals that
+    /// it's ready.
+    pending: Arc<Mutex<Option<Recording>>>,
     /// True between the stop request and the encoder finishing the file.
     stopping: bool,
     /// Last outcome plus when it was recorded, so it can expire.
@@ -195,19 +206,41 @@ impl Toolbar {
     }
 
     /// Opens a capture session on the selected window.
+    ///
+    /// Media Foundation takes a few hundred milliseconds to spin up, and that
+    /// happens before the first frame is captured so the recording doesn't open
+    /// on a run of duplicate frames. Running it on a worker keeps the toolbar
+    /// responsive through the wait.
     fn start_recording(&mut self) -> Task<Message> {
         let Some(target) = self.picker.selected.as_ref() else {
             return Task::none();
         };
 
         self.status = None;
+        self.starting = true;
 
-        match Recording::start(target.hwnd, target.alias, &self.config) {
-            Ok(recording) => self.recording = Some(recording),
-            Err(error) => self.set_status(Status::Failed(error.to_string())),
-        }
+        let (hwnd, alias) = (target.hwnd, target.alias);
+        let config = self.config.clone();
+        let slot = self.pending.clone();
 
-        Task::none()
+        let (sender, receiver) = oneshot::channel();
+        std::thread::spawn(move || {
+            let outcome = Recording::start(hwnd, alias, &config).map(|recording| {
+                if let Ok(mut slot) = slot.lock() {
+                    *slot = Some(recording);
+                }
+            });
+            let _ = sender.send(outcome);
+        });
+
+        Task::perform(
+            async move {
+                receiver.await.unwrap_or_else(|_| {
+                    Err(recorder::Error::Capture("录制线程意外结束".to_string()))
+                })
+            },
+            Message::RecordingStarted,
+        )
     }
 
     /// Stops the capture session and finalises the file.
@@ -297,9 +330,9 @@ impl Toolbar {
                 return self.stop_recording();
             }
             Message::ToggleRecording => {
-                // The button is disabled while the encoder finishes up, but a
-                // hotkey or tray action could still route here later.
-                if self.stopping {
+                // The button is disabled while the encoder starts up or
+                // finishes, but a hotkey or tray action could still route here.
+                if self.starting || self.stopping {
                     return Task::none();
                 }
 
@@ -308,6 +341,24 @@ impl Toolbar {
                 } else {
                     self.start_recording()
                 };
+            }
+            Message::RecordingStarted(result) => {
+                self.starting = false;
+
+                if let Err(error) = result {
+                    self.set_status(Status::Failed(error.to_string()));
+                    return Task::none();
+                }
+
+                self.recording = self.pending.lock().ok().and_then(|mut slot| slot.take());
+
+                // The target can be changed or cleared during the startup
+                // wait, in which case this session is already recording the
+                // wrong window – close it out immediately.
+                let target = self.picker.selected.as_ref().map(|info| info.hwnd);
+                if target != self.recording.as_ref().map(Recording::target_hwnd) {
+                    return self.stop_recording();
+                }
             }
             Message::Tick => {
                 if self
@@ -421,8 +472,10 @@ impl Toolbar {
         // window has been picked.
         let can_record = self.picker.selected.is_some();
 
-        let (indicator, label, style): (Element<Message>, String, ButtonStyleFn) = if self.stopping
+        let (indicator, label, style): (Element<Message>, String, ButtonStyleFn) = if self.starting
         {
+            (record_dot(true), "准备中".to_string(), record_idle_style)
+        } else if self.stopping {
             (stop_square(), "保存中".to_string(), record_active_style)
         } else if self.is_recording() {
             // Zero-padding keeps the label the same width all the way down, so
@@ -457,7 +510,7 @@ impl Toolbar {
         .style(style)
         // Passing None is what puts the button into Status::Disabled.
         .on_press_maybe(
-            (!self.stopping && can_record).then_some(Message::ToggleRecording),
+            (!self.starting && !self.stopping && can_record).then_some(Message::ToggleRecording),
         )
         .padding([0, 14])
         .height(32);

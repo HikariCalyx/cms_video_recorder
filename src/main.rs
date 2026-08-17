@@ -14,9 +14,18 @@ mod window_picker;
 use iced::{application::Appearance, window, Color, Theme};
 use toolbar::{Toolbar, UI_FONT};
 
+/// The same .ico that build.rs links in as a Win32 resource. The resource
+/// covers Explorer / the taskbar's pinned entry; this copy is what we hand to
+/// the windowing layer so the live window and Alt-Tab match.
+const APP_ICON: &[u8] = include_bytes!("icon.ico");
 
 fn main() -> iced::Result {
+    // `None` lets the decoder sniff the format from the file header. A failure
+    // here only costs us the icon, so it is not worth aborting startup over.
+    let icon = window::icon::from_file_data(APP_ICON, None).ok();
+
     let window_settings = window::Settings {
+        icon,
         size: iced::Size::new(toolbar::WINDOW_WIDTH, toolbar::BAR_HEIGHT),
         resizable: false,
         decorations: false,

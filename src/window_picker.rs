@@ -29,8 +29,10 @@ pub const PROCESS_ALIASES: &[(&str, &str)] = &[
     ("maplestory.exe", "冒险岛正式服"),
     ("maplestoryt.exe", "冒险岛测试服"),
     ("maplestoryta.exe", "冒险岛测试服"),
+    ("maplestorym.exe", "冒险岛M"),
     ("maplestoryn.exe", "冒险岛N"),
     ("maplestory_classic.exe", "冒险岛怀旧服"),
+    ("msw.exe", "冒险岛世界"),
 ];
 
 /// Look up the display alias for an executable name.

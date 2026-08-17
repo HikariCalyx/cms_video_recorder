@@ -23,6 +23,11 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    # WASAPI loopback capture, for recording what's playing
+    "Win32_Media_Audio",
+    # KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, to identify the device's sample format
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
     # GetLocalTime, for timestamping output file names
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
@@ -31,10 +36,15 @@ windows = { version = "0.58", features = [
 ] }
 
 [profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+opt-level = 'z'     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce number of codegen units to allow more optimizations
+panic = 'abort'     # Remove stack unwinding logic
+strip = true        # Automatically strip symbols from the binary
 
-# Windows: no console window in release builds
+# Windows: no console window in release builds — handled by the
+# #![windows_subsystem] pragma in main.rs, nothing needed here.
 [target.'cfg(windows)'.build-dependencies]
-# nothing needed here; we use #![windows_subsystem] pragma
+# Compiles app.rc (application icon + version/properties resource) and links
+# it into the executable. See build.rs.
+embed-resource = "3.0"

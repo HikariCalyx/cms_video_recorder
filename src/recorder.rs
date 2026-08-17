@@ -39,7 +39,43 @@ pub struct RecorderConfig {
     pub frame_rate: u32,
     /// Target video bitrate, in bits per second.
     pub bitrate: u32,
+    /// Record only the window's client area, dropping the title bar and
+    /// borders.
+    ///
+    /// Costs a GPU-to-system-memory copy per frame, because the encoder only
+    /// takes a GPU surface for the frame exactly as captured. Windows with no
+    /// chrome to strip stay on the zero-copy path regardless of this setting.
+    pub exclude_window_border: bool,
+    /// Largest capture that is recorded at native resolution, as
+    /// `(width, height)`.
+    ///
+    /// Anything wider or taller is halved, so a 2560x1440 window records at
+    /// 1280x720 and 3840x2160 at 1920x1080. `None` always records native.
+    pub max_native_size: Option<(u32, u32)>,
+    /// How long the capture pipeline is left to settle before frames are kept.
+    ///
+    /// Media Foundation and the hardware encoder take a moment to reach a
+    /// steady state, and frames captured during that window land in the file as
+    /// a frozen run at the head. Discarding them trades a little delay on the
+    /// Record button for a clean opening.
+    pub warmup: Duration,
+    /// Record the audio coming out of the default playback device.
+    ///
+    /// This is the whole system mix, so anything else making noise lands in the
+    /// clip too. If the device can't be opened the recording carries on without
+    /// sound rather than failing.
+    pub capture_audio: bool,
 }
+
+/// Frames captured within this long of the capture session starting are
+/// discarded, so the recording opens on a settled pipeline.
+pub const WARMUP: Duration = Duration::from_millis(600);
+
+/// Captures wider or taller than this are halved.
+///
+/// Chosen so the game's 1920x1200 mode still records natively while the 1440p
+/// and 4K modes come down to something a fixed bitrate can do justice to.
+pub const MAX_NATIVE_SIZE: (u32, u32) = (1920, 1200);
 
 impl Default for RecorderConfig {
     fn default() -> Self {
@@ -50,6 +86,10 @@ impl Default for RecorderConfig {
             // ~12 Mbps is plenty for a game window at 1080p60 and keeps a
             // 30 second clip under about 45 MB.
             bitrate: 12_000_000,
+            exclude_window_border: true,
+            max_native_size: Some(MAX_NATIVE_SIZE),
+            warmup: WARMUP,
+            capture_audio: true,
         }
     }
 }
@@ -80,6 +120,9 @@ pub enum Error {
     Encoder(String),
     /// Starting or stopping the capture session failed.
     Capture(String),
+    /// Loopback audio capture failed. Never fatal – the recording falls back
+    /// to video only.
+    Audio(String),
 }
 
 impl std::fmt::Display for Error {
@@ -88,6 +131,7 @@ impl std::fmt::Display for Error {
             Self::Io(msg) => write!(f, "文件写入失败: {msg}"),
             Self::Encoder(msg) => write!(f, "编码失败: {msg}"),
             Self::Capture(msg) => write!(f, "录制失败: {msg}"),
+            Self::Audio(msg) => write!(f, "音频录制失败: {msg}"),
         }
     }
 }
@@ -165,6 +209,8 @@ fn local_time() -> (u16, u16, u16, u16, u16, u16) {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
+mod audio;
+#[cfg(windows)]
 mod backend;
 
 #[cfg(windows)]
@@ -184,6 +230,10 @@ impl Recording {
 
     pub fn elapsed(&self) -> Duration {
         Duration::ZERO
+    }
+
+    pub fn target_hwnd(&self) -> isize {
+        0
     }
 
     pub fn target_is_alive(&self) -> bool {
