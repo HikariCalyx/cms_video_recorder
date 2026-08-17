@@ -43,6 +43,13 @@ pub fn alias_for(exe_name: &str) -> Option<&'static str> {
         .map(|(_, alias)| *alias)
 }
 
+/// Executable name without the ".exe" suffix, e.g. "MapleStory".
+pub fn strip_exe(name: &str) -> &str {
+    name.strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name)
+}
+
 /// Windows narrower than this are skipped – they're launchers, login prompts
 /// and patcher dialogs rather than the game viewport.
 ///
@@ -70,8 +77,9 @@ pub struct WindowInfo {
     pub minimized: bool,
     /// Owning executable name, e.g. "MapleStory.exe"
     pub process: String,
-    /// Friendly server name from `PROCESS_ALIASES`
-    pub alias: &'static str,
+    /// Display label: the `PROCESS_ALIASES` server name when known, otherwise
+    /// the process name without its extension.
+    pub alias: String,
     /// The window's icon, decoded once per refresh
     pub icon: Option<image::Handle>,
 }
@@ -88,10 +96,7 @@ impl WindowInfo {
 
     /// Executable name without the ".exe" suffix
     pub fn process_label(&self) -> &str {
-        let name: &str = &self.process;
-        name.strip_suffix(".exe")
-            .or_else(|| name.strip_suffix(".EXE"))
-            .unwrap_or(name)
+        strip_exe(&self.process)
     }
 
     /// Secondary line: "MapleStoryTA · 1920×1080"
@@ -121,6 +126,8 @@ pub struct WindowPickerState {
     pub selected: Option<WindowInfo>,
     /// Cached list of enumerated windows
     pub windows: Vec<WindowInfo>,
+    /// Whether windows from processes outside `PROCESS_ALIASES` are listed too
+    pub include_others: bool,
 }
 
 impl WindowPickerState {
@@ -140,7 +147,7 @@ impl WindowPickerState {
 
     /// (Re-)enumerate selectable windows and decode their icons
     pub fn refresh(&mut self) {
-        self.windows = enumerate_windows();
+        self.windows = enumerate_windows(self.include_others);
         self.attach_icons();
 
         // Drop a stale selection whose window has gone away, but keep the
@@ -177,7 +184,7 @@ impl WindowPickerState {
     /// Label shown on the toolbar button – the alias once a window is picked
     pub fn button_label(&self) -> &str {
         match &self.selected {
-            Some(info) => info.alias,
+            Some(info) => info.alias.as_str(),
             None => "选择窗口",
         }
     }
@@ -192,24 +199,39 @@ impl WindowPickerState {
 // Win32 enumeration
 // ---------------------------------------------------------------------------
 
-/// Returns visible, titled, non-cloaked top-level windows owned by one of the
-/// `ALLOWED_PROCESSES`, sorted by title.
+/// Returns visible, titled, non-cloaked top-level windows, sorted by title.
+///
+/// With `include_others` off, only windows owned by a `PROCESS_ALIASES`
+/// process are kept – that's the MapleStory family. With it on, every other
+/// capturable window joins the list as well.
 #[cfg(windows)]
-pub fn enumerate_windows() -> Vec<WindowInfo> {
-    let mut result: Vec<WindowInfo> = Vec::new();
-    let ptr = &mut result as *mut Vec<WindowInfo> as isize;
+pub fn enumerate_windows(include_others: bool) -> Vec<WindowInfo> {
+    let mut context = EnumContext {
+        windows: Vec::new(),
+        include_others,
+    };
+    let ptr = &mut context as *mut EnumContext as isize;
 
     unsafe {
         let _ = EnumWindows(Some(enum_windows_proc), LPARAM(ptr));
     }
 
-    result.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-    result
+    context
+        .windows
+        .sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    context.windows
 }
 
 #[cfg(not(windows))]
-pub fn enumerate_windows() -> Vec<WindowInfo> {
+pub fn enumerate_windows(_include_others: bool) -> Vec<WindowInfo> {
     Vec::new()
+}
+
+/// State threaded through the `EnumWindows` callback.
+#[cfg(windows)]
+struct EnumContext {
+    windows: Vec<WindowInfo>,
+    include_others: bool,
 }
 
 #[cfg(windows)]
@@ -220,13 +242,21 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         return CONTINUE;
     }
 
-    // Only accept windows owned by an allow-listed executable. A missing alias
-    // means the process isn't in the table, so the window is skipped.
+    // Allow-listed processes get their server alias. Any other process only
+    // joins the list when the "list other windows" option is on, using its
+    // bare executable name as the label.
     let Some(process) = owning_process_name(hwnd) else {
         return CONTINUE;
     };
-    let Some(alias) = alias_for(&process) else {
-        return CONTINUE;
+    let context = &mut *(lparam.0 as *mut EnumContext);
+    let alias = match alias_for(&process) {
+        Some(alias) => alias.to_string(),
+        None => {
+            if !context.include_others {
+                return CONTINUE;
+            }
+            strip_exe(&process).to_string()
+        }
     };
 
     let Some(title) = window_title(hwnd) else {
@@ -244,8 +274,8 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         return CONTINUE;
     }
 
-    let list = &mut *(lparam.0 as *mut Vec<WindowInfo>);
-    list.push(WindowInfo {
+    let context = &mut *(lparam.0 as *mut EnumContext);
+    context.windows.push(WindowInfo {
         hwnd: hwnd.0 as isize,
         title,
         width,

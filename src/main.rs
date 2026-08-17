@@ -6,12 +6,14 @@
 mod cog;
 mod config;
 mod dialog;
+mod film;
 mod hotkey;
 #[cfg(windows)]
 mod icon;
 mod recorder;
 mod settings;
 mod toolbar;
+mod videos;
 #[cfg(windows)]
 mod win32;
 mod window_picker;

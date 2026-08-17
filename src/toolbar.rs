@@ -9,8 +9,8 @@ use iced::{
     futures::channel::oneshot,
     keyboard,
     widget::{
-        button, column, container, horizontal_space, image, mouse_area, row, scrollable, text,
-        text_input,
+        button, checkbox, column, container, horizontal_space, image, mouse_area, row, scrollable,
+        text, text_input,
     },
     window, Alignment, Background, Border, Color, Element, Font, Length, Shadow, Size, Subscription,
     Task, Theme,
@@ -19,6 +19,7 @@ use iced::{
 use crate::config::AppConfig;
 use crate::recorder::{self, Recording};
 use crate::settings::{self, Capture, SettingsState};
+use crate::videos::VideosState;
 use crate::window_picker::{WindowInfo, WindowPickerState};
 
 /// Default UI font – Microsoft YaHei UI ships with Windows and covers both
@@ -63,6 +64,8 @@ pub const EXPANDED_HEIGHT: f32 = 320.0;
 /// Sized to the form's natural height – the panel doesn't scroll, so anything
 /// shorter squeezes the fields.
 pub const SETTINGS_HEIGHT: f32 = 284.0;
+/// Height when the recordings manager is expanded.
+pub const VIDEOS_HEIGHT: f32 = 320.0;
 
 // --- Timing ----------------------------------------------------------------
 
@@ -99,6 +102,8 @@ pub enum Message {
     WindowSelected(WindowInfo),
     /// Re-enumerate the available windows
     RefreshWindows,
+    /// Toggle whether non-MapleStory windows are listed as well
+    ToggleOtherWindows(bool),
     /// Forget the current selection
     ClearSelection,
     /// Toggle recording on / off
@@ -111,6 +116,18 @@ pub enum Message {
     RecordingFinished(Result<PathBuf, recorder::Error>),
     /// Expand / collapse the settings panel
     ToggleSettings,
+    /// Expand / collapse the recordings manager
+    ToggleVideos,
+    /// Re-scan the output directory for new clips
+    RefreshVideos,
+    /// Open a clip in the default player
+    PlayVideo(PathBuf),
+    /// Compress a clip – placeholder until compression ships
+    CompressVideo(PathBuf),
+    /// Reveal a clip in an Explorer window
+    BrowseVideo(PathBuf),
+    /// Delete a clip from disk
+    DeleteVideo(PathBuf),
     /// The output directory field was edited
     OutputDirChanged(String),
     /// The duration-cap field was edited
@@ -140,7 +157,12 @@ pub enum Message {
 /// Transient outcome of the last recording, shown on the toolbar.
 #[derive(Debug, Clone)]
 enum Status {
+    /// A recording finished and its file is ready.
     Saved(PathBuf),
+    /// A clip was deleted from disk.
+    Deleted(String),
+    /// A neutral message, e.g. from a placeholder action.
+    Info(String),
     Failed(String),
 }
 
@@ -152,6 +174,8 @@ pub struct Toolbar {
     pub config: AppConfig,
     /// The settings panel and its edit buffers.
     pub settings: SettingsState,
+    /// The recordings manager and its list of clips.
+    pub videos: VideosState,
     /// The live capture session, if any.
     recording: Option<Recording>,
     /// True while the encoder is spinning up, before capture begins.
@@ -226,6 +250,8 @@ impl Toolbar {
             EXPANDED_HEIGHT
         } else if self.settings.is_open {
             SETTINGS_HEIGHT
+        } else if self.videos.is_open {
+            VIDEOS_HEIGHT
         } else {
             BAR_HEIGHT
         };
@@ -287,13 +313,13 @@ impl Toolbar {
         self.status = None;
         self.starting = true;
 
-        let (hwnd, alias) = (target.hwnd, target.alias);
+        let (hwnd, alias) = (target.hwnd, target.alias.clone());
         let config = self.config.recorder_config();
         let slot = self.pending.clone();
 
         let (sender, receiver) = oneshot::channel();
         std::thread::spawn(move || {
-            let outcome = Recording::start(hwnd, alias, &config).map(|recording| {
+            let outcome = Recording::start(hwnd, &alias, &config).map(|recording| {
                 if let Ok(mut slot) = slot.lock() {
                     *slot = Some(recording);
                 }
@@ -418,6 +444,9 @@ impl Toolbar {
                 self.picker.toggle();
 
                 // Only one panel fits in the window at a time.
+                if self.picker.is_open {
+                    self.videos.is_open = false;
+                }
                 let settings = if self.picker.is_open {
                     self.close_settings()
                 } else {
@@ -446,6 +475,11 @@ impl Toolbar {
                 return Task::batch([stop, self.sync_window_size()]);
             }
             Message::RefreshWindows => {
+                self.picker.refresh();
+                return self.stop_recording_without_target();
+            }
+            Message::ToggleOtherWindows(show) => {
+                self.picker.include_others = show;
                 self.picker.refresh();
                 return self.stop_recording_without_target();
             }
@@ -511,6 +545,11 @@ impl Toolbar {
                     Ok(path) => Status::Saved(path),
                     Err(error) => Status::Failed(error.to_string()),
                 });
+
+                // A new clip just landed; the manager may be open on it.
+                if self.videos.is_open {
+                    self.videos.refresh(&self.config.output_dir);
+                }
             }
             Message::ToggleSettings => {
                 if self.settings.is_open {
@@ -526,8 +565,66 @@ impl Toolbar {
                 if self.picker.is_open {
                     self.picker.is_open = false;
                 }
+                self.videos.is_open = false;
 
                 return self.sync_window_size();
+            }
+            Message::ToggleVideos => {
+                if self.videos.is_open {
+                    self.videos.is_open = false;
+                    return self.sync_window_size();
+                }
+
+                self.videos.is_open = true;
+                self.videos.refresh(&self.config.output_dir);
+
+                // Only one panel fits in the window at a time.
+                let settings = if self.settings.is_open {
+                    self.close_settings()
+                } else {
+                    Task::none()
+                };
+                if self.picker.is_open {
+                    self.picker.is_open = false;
+                }
+
+                return Task::batch([settings, self.sync_window_size()]);
+            }
+            Message::RefreshVideos => {
+                self.videos.refresh(&self.config.output_dir);
+            }
+            Message::PlayVideo(path) => {
+                if let Err(error) = crate::videos::play(&path) {
+                    self.set_status(Status::Failed(format!("播放失败: {error}")));
+                }
+            }
+            Message::CompressVideo(path) => {
+                // Placeholder until the transcoder lands.
+                self.set_status(Status::Info(format!(
+                    "压缩功能开发中: {}",
+                    file_name(&path)
+                )));
+            }
+            Message::BrowseVideo(path) => {
+                if let Err(error) = crate::videos::browse(&path) {
+                    self.set_status(Status::Failed(format!("打开失败: {error}")));
+                }
+            }
+            Message::DeleteVideo(path) => {
+                let name = file_name(&path);
+
+                match crate::videos::delete(&path) {
+                    Ok(()) => {
+                        self.set_status(Status::Deleted(name));
+
+                        if self.videos.is_open {
+                            self.videos.refresh(&self.config.output_dir);
+                        }
+                    }
+                    Err(error) => {
+                        self.set_status(Status::Failed(format!("删除失败: {error}")));
+                    }
+                }
             }
             Message::OutputDirChanged(value) => {
                 self.settings.output_dir = value;
@@ -632,6 +729,8 @@ impl Toolbar {
             Some(self.picker_panel())
         } else if self.settings.is_open {
             Some(self.settings_panel())
+        } else if self.videos.is_open {
+            Some(self.videos_panel())
         } else {
             None
         };
@@ -748,6 +847,23 @@ impl Toolbar {
         .padding([0, 14])
         .height(32);
 
+        // --- Recordings button ---
+        let videos_btn = button(
+            container(process_icon(&crate::film::handle(), 15))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center(Length::Fill),
+        )
+        .style(if self.videos.is_open {
+            icon_btn_active_style
+        } else {
+            icon_btn_style
+        })
+        .on_press(Message::ToggleVideos)
+        .padding(0)
+        .width(28)
+        .height(28);
+
         // --- Settings button ---
         let settings_btn = button(
             container(process_icon(&crate::cog::handle(), 15))
@@ -791,7 +907,7 @@ impl Toolbar {
         )
         .on_press(Message::StartDrag);
 
-        row![grip, window_btn, record_btn, filler, settings_btn, close_btn]
+        row![grip, window_btn, record_btn, videos_btn, filler, settings_btn, close_btn]
             .spacing(8)
             .align_y(Alignment::Center)
             .padding([0, 10])
@@ -810,6 +926,11 @@ impl Toolbar {
                 format!("已保存 {}", file_name(path)),
                 Color::from_rgb8(0x7E, 0xC8, 0x8A),
             ),
+            Status::Deleted(name) => (
+                format!("已删除 {name}"),
+                Color::from_rgb8(0x7E, 0xC8, 0x8A),
+            ),
+            Status::Info(message) => (message.clone(), Color::from_rgb8(0x9C, 0xB8, 0xF0)),
             Status::Failed(reason) => (reason.clone(), Color::from_rgb8(0xE8, 0x7A, 0x7A)),
         };
 
@@ -833,9 +954,20 @@ impl Toolbar {
         .spacing(6)
         .align_y(Alignment::Center);
 
+        // The allow-list is the MapleStory family; this checkbox lets other
+        // applications through for testing or one-off captures.
+        let filter_row = checkbox("显示其他窗口", self.picker.include_others)
+            .on_toggle(Message::ToggleOtherWindows)
+            .text_size(11)
+            .style(picker_checkbox_style);
+
         let list: Element<Message> = if self.picker.windows.is_empty() {
             container(
-                text("未找到冒险岛窗口")
+                text(if self.picker.include_others {
+                    "未找到可捕获窗口"
+                } else {
+                    "未找到置于前台的冒险岛窗口"
+                })
                     .size(12)
                     .color(Color::from_rgb8(0x7A, 0x7A, 0x86)),
             )
@@ -872,7 +1004,7 @@ impl Toolbar {
                     button(
                         entry.push(
                             column![
-                                text(info.alias)
+                                text(info.alias.as_str())
                                     .size(13)
                                     .font(UI_FONT_BOLD)
                                     .width(Length::Fill)
@@ -896,7 +1028,7 @@ impl Toolbar {
             scrollable(items).height(Length::Fill).into()
         };
 
-        let mut panel = column![header, list].spacing(8).padding([8, 12]);
+        let mut panel = column![header, filter_row, list].spacing(8).padding([8, 12]);
 
         if self.picker.selected.is_some() {
             panel = panel.push(small_button("清除选择", Message::ClearSelection));
@@ -1008,6 +1140,68 @@ impl Toolbar {
             .into()
     }
 
+    /// The recordings manager: every clip in the output directory, newest
+    /// first, each with its actions.
+    fn videos_panel(&self) -> Element<'_, Message> {
+        let header = row![
+            text(format!("{} 个视频", self.videos.videos.len()))
+                .size(11)
+                .font(UI_FONT_BOLD)
+                .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
+            horizontal_space(),
+            small_button("刷新", Message::RefreshVideos),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let list: Element<Message> = if self.videos.videos.is_empty() {
+            container(
+                text("暂无录制视频")
+                    .size(12)
+                    .color(Color::from_rgb8(0x7A, 0x7A, 0x86)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill)
+            .into()
+        } else {
+            let mut items = column![].spacing(2);
+
+            for entry in &self.videos.videos {
+                let actions = row![
+                    small_button("播放", Message::PlayVideo(entry.path.clone())),
+                    small_button("压缩", Message::CompressVideo(entry.path.clone())),
+                    small_button("浏览", Message::BrowseVideo(entry.path.clone())),
+                    small_danger_button("删除", Message::DeleteVideo(entry.path.clone())),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center);
+
+                items = items.push(
+                    row![
+                        text(truncate(&entry.name, 24))
+                            .size(12)
+                            .width(Length::Fill)
+                            .wrapping(text::Wrapping::None),
+                        actions,
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .padding([6, 2]),
+                );
+            }
+
+            scrollable(items).height(Length::Fill).into()
+        };
+
+        let panel = column![header, list].spacing(8).padding([8, 12]);
+
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     /// The assigned shortcut, as one cap per key.
     ///
     /// Stays on screen while the field is armed – the caps just dim – so the
@@ -1080,6 +1274,15 @@ fn truncate(text: &str, max: usize) -> String {
 fn small_button(label: &str, msg: Message) -> Element<'_, Message> {
     button(text(label).size(11))
         .style(subtle_button_style)
+        .on_press(msg)
+        .padding([4, 9])
+        .into()
+}
+
+/// A small destructive button, e.g. the clip's "删除".
+fn small_danger_button(label: &str, msg: Message) -> Element<'_, Message> {
+    button(text(label).size(11))
+        .style(danger_button_style)
         .on_press(msg)
         .padding([4, 9])
         .into()
@@ -1347,7 +1550,7 @@ fn icon_btn_style(_theme: &Theme, status: button::Status) -> button::Style {
     rounded(14.0, bg, Color::from_rgb8(0xDC, 0xDC, 0xE4))
 }
 
-/// Highlighted while the settings panel is expanded
+/// Highlighted while the settings panel or recordings manager is expanded
 fn icon_btn_active_style(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = if is_active(status) {
         Color::from_rgb8(0x4A, 0x4A, 0x58)
@@ -1355,6 +1558,35 @@ fn icon_btn_active_style(_theme: &Theme, status: button::Status) -> button::Styl
         Color::from_rgb8(0x42, 0x42, 0x4E)
     };
     rounded(14.0, bg, Color::WHITE)
+}
+
+/// Checkbox in the window picker: toggles listing non-MapleStory windows.
+fn picker_checkbox_style(_theme: &Theme, status: checkbox::Status) -> checkbox::Style {
+    let checked = matches!(
+        status,
+        checkbox::Status::Active { is_checked: true }
+            | checkbox::Status::Hovered { is_checked: true }
+            | checkbox::Status::Disabled { is_checked: true }
+    );
+
+    checkbox::Style {
+        background: if checked {
+            Background::Color(Color::from_rgb8(0x3D, 0x74, 0xE8))
+        } else {
+            Background::Color(Color::from_rgb8(0x24, 0x24, 0x2B))
+        },
+        icon_color: Color::WHITE,
+        border: Border {
+            color: if checked {
+                Color::from_rgb8(0x3D, 0x74, 0xE8)
+            } else {
+                Color::from_rgb8(0x50, 0x50, 0x5A)
+            },
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        text_color: Some(Color::from_rgb8(0x9A, 0x9A, 0xA4)),
+    }
 }
 
 /// Text field in the settings panel
@@ -1386,6 +1618,16 @@ fn subtle_button_style(_theme: &Theme, status: button::Status) -> button::Style 
         Color::from_rgb8(0x2A, 0x2A, 0x32)
     };
     rounded(5.0, bg, Color::from_rgb8(0xC8, 0xC8, 0xD2))
+}
+
+/// Destructive action, e.g. deleting a clip
+fn danger_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = if is_active(status) {
+        Color::from_rgb8(0x8E, 0x2E, 0x2E)
+    } else {
+        Color::from_rgb8(0x50, 0x24, 0x24)
+    };
+    rounded(5.0, bg, Color::from_rgb8(0xF2, 0xC4, 0xC4))
 }
 
 fn list_item_style(_theme: &Theme, status: button::Status) -> button::Style {
