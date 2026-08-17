@@ -1,0 +1,30 @@
+[package]
+name = "cms_video_recorder"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cms_video_recorder"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.13", features = ["image"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Windows: no console window in release builds
+[target.'cfg(windows)'.build-dependencies]
+# nothing needed here; we use #![windows_subsystem] pragma
