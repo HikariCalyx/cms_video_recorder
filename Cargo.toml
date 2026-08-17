@@ -8,13 +8,23 @@ name = "cms_video_recorder"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "0.13", features = ["image"] }
+dirs = "6.0.0"
+# The "tokio" feature selects a real async backend. Without it,
+# `iced::time::every` resolves to a no-op stream and the recording
+# countdown would never tick.
+iced = { version = "0.13", features = ["image", "tokio"] }
 
 [target.'cfg(windows)'.dependencies]
+# Windows.Graphics.Capture + Media Foundation encoder, used by the recorder.
+# Brings its own (newer) `windows` crate; HWNDs cross the boundary as raw
+# pointers, so the two versions never have to agree on types.
+windows-capture = "2.0.1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    # GetLocalTime, for timestamping output file names
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",

@@ -3,6 +3,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod icon;
+mod recorder;
 mod toolbar;
 #[cfg(windows)]
 mod win32;

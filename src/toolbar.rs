@@ -1,12 +1,17 @@
 // toolbar.rs – main floating toolbar state and view
 
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
 use iced::{
     font::{Family, Weight},
-    widget::{button, column, container, horizontal_space, mouse_area, row, scrollable, text},
+    futures::channel::oneshot,
+    widget::{button, column, container, horizontal_space, image, mouse_area, row, scrollable, text},
     window, Alignment, Background, Border, Color, Element, Font, Length, Shadow, Size, Subscription,
     Task, Theme,
 };
 
+use crate::recorder::{self, RecorderConfig, Recording};
 use crate::window_picker::{WindowInfo, WindowPickerState};
 
 /// Default UI font – Microsoft YaHei UI ships with Windows and covers both
@@ -16,10 +21,14 @@ pub const UI_FONT: Font = Font {
     ..Font::DEFAULT
 };
 
-/// Semibold variant for the Record button label
-pub const UI_FONT_SEMIBOLD: Font = Font {
+/// Bold variant for emphasised labels.
+///
+/// Must be `Bold`, not `Semibold`: Microsoft YaHei UI ships Regular, Bold and
+/// Light faces only, and requesting an absent weight makes the shaper emit
+/// tofu boxes for CJK glyphs instead of falling back to the nearest weight.
+pub const UI_FONT_BOLD: Font = Font {
     family: Family::Name("Microsoft YaHei UI"),
-    weight: Weight::Semibold,
+    weight: Weight::Bold,
     ..Font::DEFAULT
 };
 
@@ -43,6 +52,23 @@ pub const BAR_HEIGHT: f32 = 52.0;
 /// Height when the picker panel is expanded
 pub const EXPANDED_HEIGHT: f32 = 320.0;
 
+// --- Timing ----------------------------------------------------------------
+
+/// How often the countdown / status clock is polled while it matters.
+///
+/// Fine-grained enough that the displayed second flips promptly, and the
+/// subscription only exists while recording or while a status is on screen.
+const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a "saved" or "failed" message stays on the toolbar.
+const STATUS_TTL: Duration = Duration::from_secs(6);
+
+/// Cap on the status text so a long error can't push the buttons around.
+const STATUS_MAX_CHARS: usize = 22;
+
+/// A `button::style` callback, as selected at runtime.
+type ButtonStyleFn = fn(&Theme, button::Status) -> button::Style;
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -65,6 +91,10 @@ pub enum Message {
     ClearSelection,
     /// Toggle recording on / off
     ToggleRecording,
+    /// Countdown / status-expiry clock
+    Tick,
+    /// The encoder finished writing the file (or failed trying)
+    RecordingFinished(Result<PathBuf, recorder::Error>),
     /// Close the application
     Close,
 }
@@ -73,11 +103,27 @@ pub enum Message {
 // State
 // ---------------------------------------------------------------------------
 
+/// Transient outcome of the last recording, shown on the toolbar.
+#[derive(Debug, Clone)]
+enum Status {
+    Saved(PathBuf),
+    Failed(String),
+}
+
 #[derive(Default)]
 pub struct Toolbar {
     pub picker: WindowPickerState,
-    pub is_recording: bool,
     pub window_id: Option<window::Id>,
+    /// Output directory, duration cap and encoder settings.
+    ///
+    /// Defaults for now; a settings panel can replace this wholesale later.
+    pub config: RecorderConfig,
+    /// The live capture session, if any.
+    recording: Option<Recording>,
+    /// True between the stop request and the encoder finishing the file.
+    stopping: bool,
+    /// Last outcome plus when it was recorded, so it can expire.
+    status: Option<(Status, Instant)>,
 }
 
 impl Toolbar {
@@ -85,12 +131,20 @@ impl Toolbar {
     // Subscription
     // -----------------------------------------------------------------------
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions = vec![
             window::open_events().map(Message::WindowOpened),
             // Reapplying the clip region on resize is more reliable than
             // chaining it after the resize task, which can race the OS.
             window::resize_events().map(|_| Message::WindowResized),
-        ])
+        ];
+
+        // Only run the clock when something on screen depends on it, so an
+        // idle toolbar doesn't redraw at all.
+        if self.recording.is_some() || self.status.is_some() {
+            subscriptions.push(iced::time::every(TICK_INTERVAL).map(|_| Message::Tick));
+        }
+
+        Subscription::batch(subscriptions)
     }
 
     /// Resize the window to match the current expanded/collapsed state
@@ -106,6 +160,81 @@ impl Toolbar {
         };
 
         window::resize(id, Size::new(WINDOW_WIDTH, height))
+    }
+
+    /// Whether a capture session is currently running.
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// Recording can't continue without a target, e.g. after the selected
+    /// window closes and a refresh drops it from the list. Whatever was
+    /// captured up to that point is still saved.
+    fn stop_recording_without_target(&mut self) -> Task<Message> {
+        if self.picker.selected.is_none() {
+            return self.stop_recording();
+        }
+        Task::none()
+    }
+
+    /// Seconds left on the clock, rounded up.
+    ///
+    /// Rounding up means the countdown reads the full budget the instant
+    /// recording starts and only reaches zero once the time is actually gone.
+    fn remaining_secs(&self) -> u64 {
+        let Some(recording) = &self.recording else {
+            return 0;
+        };
+
+        let remaining = self.config.max_duration.saturating_sub(recording.elapsed());
+        remaining.as_millis().div_ceil(1000) as u64
+    }
+
+    fn set_status(&mut self, status: Status) {
+        self.status = Some((status, Instant::now()));
+    }
+
+    /// Opens a capture session on the selected window.
+    fn start_recording(&mut self) -> Task<Message> {
+        let Some(target) = self.picker.selected.as_ref() else {
+            return Task::none();
+        };
+
+        self.status = None;
+
+        match Recording::start(target.hwnd, target.alias, &self.config) {
+            Ok(recording) => self.recording = Some(recording),
+            Err(error) => self.set_status(Status::Failed(error.to_string())),
+        }
+
+        Task::none()
+    }
+
+    /// Stops the capture session and finalises the file.
+    ///
+    /// Finalising blocks until the encoder has flushed and written the MP4
+    /// index, so it runs on a plain thread and reports back through a one-shot
+    /// channel rather than stalling the UI.
+    fn stop_recording(&mut self) -> Task<Message> {
+        let Some(recording) = self.recording.take() else {
+            return Task::none();
+        };
+
+        self.stopping = true;
+
+        let (sender, receiver) = oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(recording.finish());
+        });
+
+        Task::perform(
+            async move {
+                receiver.await.unwrap_or_else(|_| {
+                    Err(recorder::Error::Capture("录制线程意外结束".to_string()))
+                })
+            },
+            Message::RecordingFinished,
+        )
     }
 
     /// Rebuild the rounded clip region for the current window size
@@ -137,22 +266,75 @@ impl Toolbar {
                 }
             }
             Message::ToggleWindowPicker => {
+                // toggle() refreshes on open, which may drop a closed window.
                 self.picker.toggle();
-                return self.sync_window_size();
+                return Task::batch([
+                    self.stop_recording_without_target(),
+                    self.sync_window_size(),
+                ]);
             }
             Message::WindowSelected(info) => {
+                let is_new_target =
+                    self.picker.selected.as_ref().map(|s| s.hwnd) != Some(info.hwnd);
                 self.picker.select(info);
-                return self.sync_window_size();
+
+                let stop = if is_new_target {
+                    // Switching targets mid-recording would silently change
+                    // what's being captured, so close out the current clip.
+                    self.stop_recording()
+                } else {
+                    Task::none()
+                };
+
+                return Task::batch([stop, self.sync_window_size()]);
             }
             Message::RefreshWindows => {
                 self.picker.refresh();
+                return self.stop_recording_without_target();
             }
             Message::ClearSelection => {
                 self.picker.selected = None;
+                return self.stop_recording();
             }
             Message::ToggleRecording => {
-                self.is_recording = !self.is_recording;
-                // TODO: wire up actual capture backend here
+                // The button is disabled while the encoder finishes up, but a
+                // hotkey or tray action could still route here later.
+                if self.stopping {
+                    return Task::none();
+                }
+
+                return if self.is_recording() {
+                    self.stop_recording()
+                } else {
+                    self.start_recording()
+                };
+            }
+            Message::Tick => {
+                if self
+                    .status
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() >= STATUS_TTL)
+                {
+                    self.status = None;
+                }
+
+                // The encoder enforces the same cap on its side; this is what
+                // makes the UI agree with it. Losing the target window ends
+                // the recording too, otherwise the countdown would keep
+                // running against a file that's already closed.
+                if self.recording.as_ref().is_some_and(|recording| {
+                    recording.elapsed() >= self.config.max_duration
+                        || !recording.target_is_alive()
+                }) {
+                    return self.stop_recording();
+                }
+            }
+            Message::RecordingFinished(result) => {
+                self.stopping = false;
+                self.set_status(match result {
+                    Ok(path) => Status::Saved(path),
+                    Err(error) => Status::Failed(error.to_string()),
+                });
             }
             Message::Close => {
                 if let Some(id) = self.window_id {
@@ -203,32 +385,59 @@ impl Toolbar {
         )
         .on_press(Message::StartDrag);
 
-        // --- Window-selection button (half the previous width) ---
-        let window_btn = button(
+        // --- Window-selection button: icon + alias ---
+        let mut selection = row![]
+            .spacing(6)
+            .height(Length::Fill)
+            .align_y(Alignment::Center);
+
+        if let Some(handle) = self.picker.selected_icon() {
+            selection = selection.push(process_icon(handle, 16));
+        }
+
+        selection = selection.push(
             text(self.picker.button_label())
                 .size(13)
                 .height(Length::Fill)
+                .wrapping(text::Wrapping::None)
                 .align_y(iced::alignment::Vertical::Center),
-        )
+        );
+
+        let window_btn = button(selection)
         .style(if self.picker.is_open {
             window_select_active_style
         } else {
             window_select_style
         })
         .on_press(Message::ToggleWindowPicker)
-        .width(Length::Fixed(100.0))
+        // Shrink keeps it compact when nothing is selected and grows just
+        // enough for an alias plus icon once one is.
+        .width(Length::Shrink)
         .padding([0, 10])
         .height(32);
 
         // --- Record / Stop button ---
-        let (indicator, label, style): (
-            Element<Message>,
-            &str,
-            fn(&Theme, button::Status) -> button::Style,
-        ) = if self.is_recording {
-            (stop_square(), "Stop", record_active_style)
+        // Recording needs a target, so the button stays disabled until a
+        // window has been picked.
+        let can_record = self.picker.selected.is_some();
+
+        let (indicator, label, style): (Element<Message>, String, ButtonStyleFn) = if self.stopping
+        {
+            (stop_square(), "保存中".to_string(), record_active_style)
+        } else if self.is_recording() {
+            // Zero-padding keeps the label the same width all the way down, so
+            // the button doesn't twitch as the countdown crosses ten seconds.
+            (
+                stop_square(),
+                format!("停止 {:02}s", self.remaining_secs()),
+                record_active_style,
+            )
         } else {
-            (record_dot(), "Record", record_idle_style)
+            (
+                record_dot(can_record),
+                "录制".to_string(),
+                record_idle_style,
+            )
         };
 
         let record_btn = button(
@@ -236,8 +445,9 @@ impl Toolbar {
                 indicator,
                 text(label)
                     .size(13)
-                    .font(UI_FONT_SEMIBOLD)
+                    .font(UI_FONT_BOLD)
                     .height(Length::Fill)
+                    .wrapping(text::Wrapping::None)
                     .align_y(iced::alignment::Vertical::Center)
             ]
             .spacing(7)
@@ -245,7 +455,10 @@ impl Toolbar {
             .align_y(Alignment::Center),
         )
         .style(style)
-        .on_press(Message::ToggleRecording)
+        // Passing None is what puts the button into Status::Disabled.
+        .on_press_maybe(
+            (!self.stopping && can_record).then_some(Message::ToggleRecording),
+        )
         .padding([0, 14])
         .height(32);
 
@@ -265,11 +478,13 @@ impl Toolbar {
         .width(28)
         .height(28);
 
-        // The filler doubles as drag surface.
+        // The filler doubles as drag surface, and carries the status readout.
         let filler = mouse_area(
-            container(horizontal_space())
+            container(self.status_text())
                 .width(Length::Fill)
-                .height(Length::Fill),
+                .height(Length::Fill)
+                .clip(true)
+                .align_y(iced::alignment::Vertical::Center),
         )
         .on_press(Message::StartDrag);
 
@@ -280,22 +495,44 @@ impl Toolbar {
             .into()
     }
 
+    /// Result of the last recording, or empty space when there's nothing to
+    /// say. Doubles as part of the drag surface, so it must stay non-clickable.
+    fn status_text(&self) -> Element<'_, Message> {
+        let Some((status, _)) = &self.status else {
+            return horizontal_space().into();
+        };
+
+        let (message, color) = match status {
+            Status::Saved(path) => (
+                format!("已保存 {}", file_name(path)),
+                Color::from_rgb8(0x7E, 0xC8, 0x8A),
+            ),
+            Status::Failed(reason) => (reason.clone(), Color::from_rgb8(0xE8, 0x7A, 0x7A)),
+        };
+
+        text(truncate(&message, STATUS_MAX_CHARS))
+            .size(10)
+            .color(color)
+            .wrapping(text::Wrapping::None)
+            .into()
+    }
+
     /// The expandable list of capturable windows
     fn picker_panel(&self) -> Element<'_, Message> {
         let header = row![
-            text(format!("{} windows", self.picker.windows.len()))
+            text(format!("{} 个窗口", self.picker.windows.len()))
                 .size(11)
-                .font(UI_FONT_SEMIBOLD)
+                .font(UI_FONT_BOLD)
                 .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
             horizontal_space(),
-            small_button("Refresh", Message::RefreshWindows),
+            small_button("刷新", Message::RefreshWindows),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
 
         let list: Element<Message> = if self.picker.windows.is_empty() {
             container(
-                text("No capturable windows found")
+                text("未找到冒险岛窗口")
                     .size(12)
                     .color(Color::from_rgb8(0x7A, 0x7A, 0x86)),
             )
@@ -313,19 +550,34 @@ impl Toolbar {
                     .as_ref()
                     .is_some_and(|s| s.hwnd == info.hwnd);
 
+                // Two lines: window title, then process name + dimensions.
+                // Several MapleStory variants can run at once, so the
+                // executable disambiguates similarly-titled windows.
+                let detail_color = if is_selected {
+                    Color::from_rgb8(0xD2, 0xDF, 0xFF)
+                } else {
+                    Color::from_rgb8(0x7E, 0x7E, 0x8A)
+                };
+
+                let mut entry = row![].spacing(9).align_y(Alignment::Center);
+
+                if let Some(handle) = &info.icon {
+                    entry = entry.push(process_icon(handle, 22));
+                }
+
                 items = items.push(
                     button(
-                        row![
-                            text(&info.title)
-                                .size(12)
-                                .width(Length::Fill)
-                                .wrapping(text::Wrapping::None),
-                            text(info.dimensions())
-                                .size(11)
-                                .color(Color::from_rgb8(0x7E, 0x7E, 0x8A)),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
+                        entry.push(
+                            column![
+                                text(info.alias)
+                                    .size(13)
+                                    .font(UI_FONT_BOLD)
+                                    .width(Length::Fill)
+                                    .wrapping(text::Wrapping::None),
+                                text(info.detail()).size(10).color(detail_color),
+                            ]
+                            .spacing(1),
+                        ),
                     )
                     .style(if is_selected {
                         list_item_selected_style
@@ -344,7 +596,7 @@ impl Toolbar {
         let mut panel = column![header, list].spacing(8).padding([8, 12]);
 
         if self.picker.selected.is_some() {
-            panel = panel.push(small_button("Clear selection", Message::ClearSelection));
+            panel = panel.push(small_button("清除选择", Message::ClearSelection));
         }
 
         container(panel)
@@ -365,11 +617,42 @@ impl Toolbar {
 // Small building blocks
 // ---------------------------------------------------------------------------
 
+/// File name of a path, for display. Falls back to the whole path.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Clips to `max` characters, adding an ellipsis when something was cut.
+///
+/// Counts chars rather than bytes so CJK text isn't split mid-codepoint.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
 fn small_button(label: &str, msg: Message) -> Element<'_, Message> {
     button(text(label).size(11))
         .style(subtle_button_style)
         .on_press(msg)
         .padding([4, 9])
+        .into()
+}
+
+/// A process icon at a fixed square size.
+///
+/// The handle is reference-counted, so cloning it per frame is cheap – the
+/// pixels are decoded once per refresh, not per redraw.
+fn process_icon<'a>(handle: &image::Handle, size: u16) -> Element<'a, Message> {
+    image(handle.clone())
+        .width(Length::Fixed(size as f32))
+        .height(Length::Fixed(size as f32))
+        .content_fit(iced::ContentFit::Contain)
         .into()
 }
 
@@ -402,13 +685,19 @@ fn grip_bar<'a>() -> Element<'a, Message> {
         .into()
 }
 
-/// Red circle used for the idle Record button
-fn record_dot<'a>() -> Element<'a, Message> {
+/// Red circle used for the idle Record button, dimmed when unavailable
+fn record_dot<'a>(enabled: bool) -> Element<'a, Message> {
+    let fill = if enabled {
+        Color::from_rgb8(0xFF, 0x5B, 0x5B)
+    } else {
+        Color::from_rgb8(0x6E, 0x5A, 0x5A)
+    };
+
     container(text(""))
         .width(10)
         .height(10)
-        .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgb8(0xFF, 0x5B, 0x5B))),
+        .style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(fill)),
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
@@ -457,6 +746,19 @@ fn is_active(status: button::Status) -> bool {
     matches!(status, button::Status::Hovered | button::Status::Pressed)
 }
 
+fn is_disabled(status: button::Status) -> bool {
+    matches!(status, button::Status::Disabled)
+}
+
+/// Muted fill + faded label for a button that can't be pressed
+fn disabled_style(radius: f32) -> button::Style {
+    rounded(
+        radius,
+        Color::from_rgb8(0x28, 0x28, 0x30),
+        Color::from_rgb8(0x6A, 0x6A, 0x76),
+    )
+}
+
 /// The visible pill, filling the whole clipped window.
 fn pill_style(_theme: &Theme) -> container::Style {
     container::Style {
@@ -491,6 +793,10 @@ fn window_select_active_style(_theme: &Theme, status: button::Status) -> button:
 }
 
 fn record_idle_style(_theme: &Theme, status: button::Status) -> button::Style {
+    if is_disabled(status) {
+        return disabled_style(6.0);
+    }
+
     let bg = if is_active(status) {
         Color::from_rgb8(0x3D, 0x74, 0xE8)
     } else {
@@ -500,6 +806,12 @@ fn record_idle_style(_theme: &Theme, status: button::Status) -> button::Style {
 }
 
 fn record_active_style(_theme: &Theme, status: button::Status) -> button::Style {
+    // Reached while the encoder is finalising the file, when the button is
+    // showing "保存中" and can't be pressed.
+    if is_disabled(status) {
+        return disabled_style(6.0);
+    }
+
     let bg = if is_active(status) {
         Color::from_rgb8(0xD2, 0x2E, 0x2E)
     } else {

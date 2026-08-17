@@ -1,23 +1,62 @@
 // window_picker.rs – enumerates selectable top-level windows via Win32
 
+use iced::widget::image;
+
 #[cfg(windows)]
-use windows::Win32::{
-    Foundation::{BOOL, HWND, LPARAM, RECT},
-    Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
-    System::Threading::GetCurrentProcessId,
-    UI::WindowsAndMessaging::{
-        EnumWindows, GetAncestor, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GA_ROOT, GWL_EXSTYLE,
-        WS_EX_TOOLWINDOW,
+use windows::{
+    core::PWSTR,
+    Win32::{
+        Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT},
+        Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
+        System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+        UI::WindowsAndMessaging::{
+            EnumWindows, GetAncestor, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+            GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GA_ROOT,
+            GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+        },
     },
 };
+
+/// Executables that may be captured, each mapped to a display alias.
+///
+/// This table doubles as the allow-list: a window whose owning process is not
+/// listed here is never offered as a capture target. Keys are compared
+/// case-insensitively against the process image file name.
+pub const PROCESS_ALIASES: &[(&str, &str)] = &[
+    ("maplestory.exe", "冒险岛正式服"),
+    ("maplestoryt.exe", "冒险岛测试服"),
+    ("maplestoryta.exe", "冒险岛测试服"),
+    ("maplestoryn.exe", "冒险岛N"),
+    ("maplestory_classic.exe", "冒险岛怀旧服"),
+];
+
+/// Look up the display alias for an executable name.
+pub fn alias_for(exe_name: &str) -> Option<&'static str> {
+    PROCESS_ALIASES
+        .iter()
+        .find(|(exe, _)| exe_name.eq_ignore_ascii_case(exe))
+        .map(|(_, alias)| *alias)
+}
+
+/// Windows narrower than this are skipped – they're launchers, login prompts
+/// and patcher dialogs rather than the game viewport.
+///
+/// Note this also excludes minimised windows, whose `GetWindowRect` reports a
+/// small off-screen placeholder rather than the restored size.
+pub const MIN_WINDOW_WIDTH: i32 = 800;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 /// A window that can be picked as a capture target
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` is deliberately not derived – identity is the `hwnd` alone, and
+/// the icon handle should never participate in comparisons.
+#[derive(Debug, Clone)]
 pub struct WindowInfo {
     /// Raw HWND value – used by the capture backend
     pub hwnd: isize,
@@ -27,16 +66,38 @@ pub struct WindowInfo {
     pub height: i32,
     /// Whether the window is currently minimised
     pub minimized: bool,
+    /// Owning executable name, e.g. "MapleStory.exe"
+    pub process: String,
+    /// Friendly server name from `PROCESS_ALIASES`
+    pub alias: &'static str,
+    /// The window's icon, decoded once per refresh
+    pub icon: Option<image::Handle>,
 }
 
 impl WindowInfo {
     /// Short "1920×1080" style description
     pub fn dimensions(&self) -> String {
         if self.minimized {
-            "minimised".to_string()
+            "已最小化".to_string()
         } else {
             format!("{}\u{00D7}{}", self.width, self.height)
         }
+    }
+
+    /// Executable name without the ".exe" suffix
+    pub fn process_label(&self) -> &str {
+        let name: &str = &self.process;
+        name.strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".EXE"))
+            .unwrap_or(name)
+    }
+
+    /// Secondary line: "MapleStoryTA · 1920×1080"
+    ///
+    /// The executable is included because MapleStoryT and MapleStoryTA share
+    /// the same alias, so the alias alone can't distinguish them.
+    pub fn detail(&self) -> String {
+        format!("{} \u{00B7} {}", self.process_label(), self.dimensions())
     }
 }
 
@@ -75,17 +136,53 @@ impl WindowPickerState {
         self.is_open = false;
     }
 
-    /// (Re-)enumerate selectable windows
+    /// (Re-)enumerate selectable windows and decode their icons
     pub fn refresh(&mut self) {
         self.windows = enumerate_windows();
+        self.attach_icons();
+
+        // Drop a stale selection whose window has gone away, but keep the
+        // freshly decoded icon/size for one that is still present.
+        if let Some(selected) = &self.selected {
+            match self.windows.iter().find(|w| w.hwnd == selected.hwnd) {
+                Some(current) => self.selected = Some(current.clone()),
+                None => self.selected = None,
+            }
+        }
     }
 
-    /// Label shown on the toolbar button
+    /// Decode one icon per distinct executable and share it across windows.
+    fn attach_icons(&mut self) {
+        let mut cache: std::collections::HashMap<String, Option<image::Handle>> =
+            std::collections::HashMap::new();
+
+        for info in &mut self.windows {
+            let key = info.process.to_lowercase();
+
+            let handle = match cache.get(&key) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let decoded = decode_window_icon(info.hwnd);
+                    cache.insert(key, decoded.clone());
+                    decoded
+                }
+            };
+
+            info.icon = handle;
+        }
+    }
+
+    /// Label shown on the toolbar button – the alias once a window is picked
     pub fn button_label(&self) -> &str {
         match &self.selected {
-            Some(info) => info.title.as_str(),
-            None => "Select Window",
+            Some(info) => info.alias,
+            None => "选择窗口",
         }
+    }
+
+    /// Icon of the current selection, for the toolbar button
+    pub fn selected_icon(&self) -> Option<&image::Handle> {
+        self.selected.as_ref().and_then(|s| s.icon.as_ref())
     }
 }
 
@@ -93,8 +190,8 @@ impl WindowPickerState {
 // Win32 enumeration
 // ---------------------------------------------------------------------------
 
-/// Returns visible, titled, non-cloaked top-level windows belonging to other
-/// processes, sorted by title.
+/// Returns visible, titled, non-cloaked top-level windows owned by one of the
+/// `ALLOWED_PROCESSES`, sorted by title.
 #[cfg(windows)]
 pub fn enumerate_windows() -> Vec<WindowInfo> {
     let mut result: Vec<WindowInfo> = Vec::new();
@@ -121,16 +218,29 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         return CONTINUE;
     }
 
+    // Only accept windows owned by an allow-listed executable. A missing alias
+    // means the process isn't in the table, so the window is skipped.
+    let Some(process) = owning_process_name(hwnd) else {
+        return CONTINUE;
+    };
+    let Some(alias) = alias_for(&process) else {
+        return CONTINUE;
+    };
+
     let Some(title) = window_title(hwnd) else {
         return CONTINUE;
     };
 
     let mut rect = RECT::default();
-    let (width, height) = if GetWindowRect(hwnd, &mut rect).is_ok() {
-        (rect.right - rect.left, rect.bottom - rect.top)
-    } else {
-        (0, 0)
-    };
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return CONTINUE;
+    }
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+
+    if width < MIN_WINDOW_WIDTH {
+        return CONTINUE;
+    }
 
     let list = &mut *(lparam.0 as *mut Vec<WindowInfo>);
     list.push(WindowInfo {
@@ -139,13 +249,69 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         width,
         height,
         minimized: IsIconic(hwnd).as_bool(),
+        process,
+        alias,
+        // Filled in afterwards by `attach_icons`; decoding here would run
+        // inside the enumeration callback for every candidate window.
+        icon: None,
     });
 
     CONTINUE
 }
 
+/// Decode a window's icon into an iced image handle.
+#[cfg(windows)]
+fn decode_window_icon(hwnd: isize) -> Option<image::Handle> {
+    let icon = crate::icon::icon_for_window(hwnd)?;
+    Some(image::Handle::from_rgba(
+        icon.width,
+        icon.height,
+        icon.pixels,
+    ))
+}
+
+#[cfg(not(windows))]
+fn decode_window_icon(_hwnd: isize) -> Option<image::Handle> {
+    None
+}
+
+/// Resolves the executable file name that owns `hwnd`, e.g. "MapleStory.exe".
+#[cfg(windows)]
+unsafe fn owning_process_name(hwnd: HWND) -> Option<String> {
+    let mut pid = 0u32;
+    let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 {
+        return None;
+    }
+
+    // LIMITED_INFORMATION is enough for the image name and, unlike full query
+    // access, succeeds without elevation for most processes.
+    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+
+    let mut buf = [0u16; 260]; // MAX_PATH
+    let mut len = buf.len() as u32;
+    let query = QueryFullProcessImageNameW(
+        handle,
+        PROCESS_NAME_WIN32,
+        PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    );
+    let _ = CloseHandle(handle);
+    query.ok()?;
+
+    let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+
+    // Keep only the file name component
+    full_path
+        .rsplit(['\\', '/'])
+        .next()
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty())
+}
+
 /// Filters out the noise that `EnumWindows` reports: invisible windows, tool
-/// windows, DWM-cloaked UWP ghosts, child windows and our own toolbar.
+/// windows, DWM-cloaked UWP ghosts and child windows. Process filtering is
+/// handled separately by the allow-list.
 #[cfg(windows)]
 unsafe fn is_capturable(hwnd: HWND) -> bool {
     if !IsWindowVisible(hwnd).as_bool() {
@@ -160,13 +326,6 @@ unsafe fn is_capturable(hwnd: HWND) -> bool {
     // Skip tool windows (palettes, tray helpers, ...)
     let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
     if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
-        return false;
-    }
-
-    // Skip our own window so the toolbar can't record itself
-    let mut pid = 0u32;
-    let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid == GetCurrentProcessId() {
         return false;
     }
 
