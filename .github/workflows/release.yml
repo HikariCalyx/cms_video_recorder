@@ -47,7 +47,7 @@ jobs:
 
       - name: Verify ffmpeg binary
         shell: pwsh
-        run: & "dist\ffmpeg.exe" -version
+        run: dist\ffmpeg.exe -version
 
       - name: Stage application binary next to ffmpeg
         shell: pwsh
