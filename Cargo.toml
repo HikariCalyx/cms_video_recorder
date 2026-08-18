@@ -27,6 +27,9 @@ serde_json = "1.0.145"
 windows-capture = "2.0.1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    # ApiInformation::IsPropertyPresent, to check whether the capture
+    # border can be disabled (Windows 11+ only)
+    "Foundation_Metadata",
     # GetUserDefaultLocaleName, to pick the first-run language
     "Win32_Globalization",
     "Win32_Graphics_Dwm",

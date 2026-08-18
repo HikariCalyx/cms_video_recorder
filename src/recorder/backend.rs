@@ -246,6 +246,24 @@ fn repack(frame: &mut Frame, layout: Layout, dst: &mut Vec<u8>) -> Result<(), Er
 // Handle held by the UI
 // ---------------------------------------------------------------------------
 
+/// Whether `GraphicsCaptureSession.IsBorderRequired` can be set.
+///
+/// The property only exists on Windows 11 (build 22000) and later. On
+/// Windows 10 the system always draws the yellow "being captured" border,
+/// and windows-capture fails the whole session when `WithoutBorder` is
+/// requested there, so the caller falls back to `DrawBorderSettings::Default`
+/// and the client-area crop keeps the border out of the recording.
+fn border_toggle_supported() -> bool {
+    use windows::core::HSTRING;
+    use windows::Foundation::Metadata::ApiInformation;
+
+    ApiInformation::IsPropertyPresent(
+        &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+        &HSTRING::from("IsBorderRequired"),
+    )
+    .unwrap_or(false)
+}
+
 /// A capture session in progress.
 pub struct Recording {
     control: CaptureControl<Session, Error>,
@@ -291,14 +309,22 @@ impl Recording {
                 }
             });
 
+        // The yellow "being captured" border has to be turned off where the
+        // API allows it. `IsBorderRequired` only exists on Windows 11, and
+        // Windows 10 rejects the whole session when asked to toggle it, so
+        // there the border is left to the system default.
+        let draw_border = if border_toggle_supported() {
+            DrawBorderSettings::WithoutBorder
+        } else {
+            DrawBorderSettings::Default
+        };
+
         let settings = Settings::new(
             window,
             // The cursor is outside the game window most of the time and only
             // adds a distraction when it isn't.
             CursorCaptureSettings::WithoutCursor,
-            // The yellow "being captured" border would be baked into the
-            // recording.
-            DrawBorderSettings::WithoutBorder,
+            draw_border,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
