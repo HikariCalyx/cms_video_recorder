@@ -65,7 +65,12 @@ jobs:
 
       - name: Build installer
         shell: pwsh
-        run: makensis.exe "/DVERSION=${{ steps.package-version.outputs.version }}" install.nsi
+        run: |
+          # The choco "nsis" package runs the official NSIS setup, which
+          # installs into "C:\Program Files (x86)\NSIS" – not on PATH.
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { $makensis = "C:\Program Files\NSIS\makensis.exe" }
+          & $makensis "/DVERSION=${{ steps.package-version.outputs.version }}" install.nsi
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
