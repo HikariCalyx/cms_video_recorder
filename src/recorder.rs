@@ -37,7 +37,11 @@ pub struct RecorderConfig {
     /// Recording stops automatically after this long. `None` runs until the
     /// user stops it.
     pub max_duration: Option<Duration>,
-    /// Encoder frame rate hint, in frames per second.
+    /// Frame rate the recording is capped at, in frames per second.
+    ///
+    /// Also the encoder's rate hint, so the declared rate and the actual
+    /// cadence can't disagree. The capture backend drops frames that arrive
+    /// faster than this.
     pub frame_rate: u32,
     /// Target video bitrate, in bits per second.
     pub bitrate: u32,
@@ -84,8 +88,8 @@ impl Default for RecorderConfig {
         Self {
             output_dir: default_output_dir(),
             max_duration: Some(MAX_DURATION),
-            frame_rate: 60,
-            // ~12 Mbps is plenty for a game window at 1080p60 and keeps a
+            frame_rate: 30,
+            // ~12 Mbps is plenty for a game window at 1080p30 and keeps a
             // 30 second clip under about 45 MB.
             bitrate: 12_000_000,
             exclude_window_border: true,

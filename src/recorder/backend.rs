@@ -438,6 +438,15 @@ struct Flags {
     audio: Option<Arc<AudioCapture>>,
 }
 
+/// Kept-frame interval for the fps cap, in 100ns ticks.
+///
+/// Three quarters of the nominal interval: enough slack that a source already
+/// at the capped rate survives arrival jitter, while a faster source (e.g.
+/// 60 fps) still gets decimated to exactly the cap.
+fn cap_interval_ticks(frame_rate: u32) -> i64 {
+    10_000_000i64 / frame_rate.max(1) as i64 * 3 / 4
+}
+
 /// Lives on the capture thread and owns the encoder.
 struct Session {
     /// Taken by `finalize`, so `None` means the file is already closed out.
@@ -448,6 +457,9 @@ struct Session {
     keep_from: Option<Instant>,
     /// Arrival of the first kept frame – the clock the duration cap runs on.
     first_frame: Option<Instant>,
+    /// Capture timestamp of the last frame sent to the encoder, in 100ns
+    /// ticks, for the fps throttle.
+    last_sent: Option<i64>,
     /// Source region and encoded size, fixed before capture starts.
     layout: Layout,
     /// Reused destination for repacked pixels, so the copy doesn't allocate.
@@ -482,7 +494,7 @@ impl Session {
     /// Hands whatever loopback has captured to the encoder.
     ///
     /// Driven from frame arrival rather than its own thread so the encoder is
-    /// only ever touched from the capture thread. At 60fps that's a handful of
+    /// only ever touched from the capture thread. At 30fps that's a handful of
     /// milliseconds of audio per call, well inside the encoder's buffer.
     fn pump_audio(&mut self) -> Result<(), Error> {
         let Some(audio) = &self.flags.audio else {
@@ -546,6 +558,7 @@ impl GraphicsCaptureApiHandler for Session {
             encoder: Some(encoder),
             keep_from: None,
             first_frame: None,
+            last_sent: None,
             layout,
             scratch: Vec::new(),
             flags,
@@ -574,6 +587,24 @@ impl GraphicsCaptureApiHandler for Session {
         if Instant::now() < keep_from {
             return Ok(());
         }
+
+        // Cap the recorded frame rate: frames whose capture timestamp is
+        // sooner than the configured interval after the previous kept frame
+        // are dropped. The threshold is shortened by a quarter so a source
+        // already delivering at exactly the capped rate (with the usual
+        // vsync jitter) passes every frame instead of being halved by the
+        // comparison, while a faster source is still throttled to the cap.
+        let timestamp = frame
+            .timestamp()
+            .map_err(|error| Error::Capture(error.to_string()))?
+            .Duration;
+
+        if let Some(last_sent) = self.last_sent {
+            if timestamp - last_sent < cap_interval_ticks(self.flags.config.frame_rate) {
+                return Ok(());
+            }
+        }
+        self.last_sent = Some(timestamp);
 
         let first = self.first_frame.is_none();
         let start = *self.first_frame.get_or_insert_with(Instant::now);
@@ -611,11 +642,6 @@ impl GraphicsCaptureApiHandler for Session {
             // before the encoder gets around to reading it. That aliasing
             // showed up as long runs of duplicate frames. Copying the pixels
             // out here is what makes each frame independent.
-            let timestamp = frame
-                .timestamp()
-                .map_err(|error| Error::Capture(error.to_string()))?
-                .Duration;
-
             repack(frame, layout, &mut self.scratch)?;
 
             self.encoder

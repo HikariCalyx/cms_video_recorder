@@ -24,7 +24,7 @@ Unicode true
 ; Keep in sync with `version` in Cargo.toml. CI passes the real value as
 ; /DVERSION=x.y.z, so it can't drift there.
 !ifndef VERSION
-    !define VERSION "0.1.0"
+    !define VERSION "0.1.1"
 !endif
 ; VIProductVersion wants four 16-bit numbers; Cargo.toml versions are three-part.
 !define VERSION4 "${VERSION}.0"

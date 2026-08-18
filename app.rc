@@ -25,8 +25,8 @@
 //     ignore them.
 // ---------------------------------------------------------------------------
 1 VERSIONINFO
-FILEVERSION    0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION    0,1,1,0
+PRODUCTVERSION 0,1,1,0
 FILEFLAGSMASK  0x3FL      // VS_FFI_FILEFLAGSMASK
 FILEFLAGS      0x0L       // 0x1L = VS_FF_DEBUG, 0x2L = VS_FF_PRERELEASE
 FILEOS         0x40004L   // VOS_NT_WINDOWS32
@@ -41,13 +41,13 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Hikari Calyx Tech"
             VALUE "FileDescription",  "CMS Video Recorder"
-            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "FileVersion",      "0.1.1.0"
             VALUE "InternalName",     "cms_video_recorder"
             VALUE "LegalCopyright",   "Hikari Calyx Tech"
             VALUE "LegalTrademarks",  "Hikari Calyx Tech"
             VALUE "OriginalFilename", "cms_video_recorder.exe"
             VALUE "ProductName",      "CMS Video Recorder"
-            VALUE "ProductVersion",   "0.1.0.0"
+            VALUE "ProductVersion",   "0.1.1.0"
             VALUE "Comments",         ""
         END
     END
