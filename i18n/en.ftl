@@ -59,6 +59,17 @@ word-unknown-error = unknown error
 dialog-pick-folder = Choose save location
 dialog-save-compressed = Save compressed video
 
+# Trim dialog
+panel-trim = Trim clip
+trim-start = Start { $time }
+trim-end = End { $time }
+trim-loading = Reading duration…
+trim-ready = Drag the handles to pick a segment, then preview it
+trim-no-duration = Could not read the clip duration
+trim-preview-error = Preview failed: { $error }
+btn-preview = Preview
+btn-stop-preview = Stop
+
 # MapleStory server aliases
 alias-live = MapleStory
 alias-test = MapleStory Test

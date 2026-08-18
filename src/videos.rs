@@ -155,9 +155,9 @@ const BITRATE_STEP: i64 = 200;
 const MIN_BITRATE: i64 = 200;
 
 /// ffmpeg is a console app; without this a console window would flash for
-/// every pass.
+/// every pass. Shared with the trim preview, which also spawns ffmpeg.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// What a compression pass produced.
 #[derive(Debug, Clone, Copy)]
@@ -215,24 +215,28 @@ impl CompressionSession {
 /// Re-encodes `source` into `destination` with ffmpeg, walking the bitrate
 /// down from 5 Mbps in 200 kbps steps until the file shrinks under 5000 KB.
 ///
-/// The source is only ever read, never modified: ffmpeg writes a temporary
-/// file next to the destination and it is renamed over on success. Runs to
-/// completion before returning, so it belongs on a worker thread. The shared
-/// `session` lets the UI cancel mid-pass.
+/// `range` trims the pass to a segment, in seconds: `-ss` seeks the input
+/// and `-t` bounds the output. The source is only ever read, never modified:
+/// ffmpeg writes a temporary file next to the destination and it is renamed
+/// over on success. Runs to completion before returning, so it belongs on a
+/// worker thread. The shared `session` lets the UI cancel mid-pass.
 pub fn compress_to(
     source: &Path,
     destination: &Path,
     session: &CompressionSession,
+    range: Option<(f64, f64)>,
 ) -> CompressionReport {
     let Some(ffmpeg) = ffmpeg_path() else {
         return CompressionReport::Failed(crate::i18n::tr("error-ffmpeg-missing"));
     };
 
-    // Nothing to gain from re-encoding; copy the clip straight across.
+    // Nothing to gain from re-encoding an already-small clip; copy it
+    // straight across. A requested trim still has to re-encode, since the
+    // output is a different segment.
     let current = std::fs::metadata(source)
         .map(|meta| meta.len())
         .unwrap_or(0);
-    if current < TARGET_BYTES {
+    if range.is_none() && current < TARGET_BYTES {
         if source != destination {
             if let Err(error) = std::fs::copy(source, destination) {
                 return CompressionReport::Failed(crate::i18n::tr_arg(
@@ -260,7 +264,7 @@ pub fn compress_to(
             return CompressionReport::Cancelled;
         }
 
-        match run_ffmpeg(&ffmpeg, source, &temp, bitrate, session) {
+        match run_ffmpeg(&ffmpeg, source, &temp, bitrate, range, session) {
             PassOutcome::Done => {}
             PassOutcome::Failed(error) => {
                 let _ = std::fs::remove_file(&temp);
@@ -385,13 +389,14 @@ fn run_ffmpeg(
     input: &Path,
     output: &Path,
     bitrate_kbps: i64,
+    range: Option<(f64, f64)>,
     session: &CompressionSession,
 ) -> PassOutcome {
     use std::io::Read;
 
     let mut command = std::process::Command::new(ffmpeg);
     command
-        .args(ffmpeg_args(input, output, bitrate_kbps))
+        .args(ffmpeg_args(input, output, bitrate_kbps, range))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
@@ -499,13 +504,34 @@ fn run_ffmpeg(
 /// Command line for one pass. Video is re-encoded to the requested bitrate;
 /// audio is copied through untouched.
 ///
+/// Input seeking (`-ss` before `-i`) is fast and keyframe-accurate for the
+/// re-encoded video; `-t` after the input bounds the output to the selected
+/// segment.
+///
 /// `-f mp4` matters: the temporary file ends in `.compress`, not `.mp4`, so
 /// without an explicit format ffmpeg has no extension to guess a muxer from.
-fn ffmpeg_args(input: &Path, output: &Path, bitrate_kbps: i64) -> Vec<String> {
-    vec![
-        "-y".to_string(),
-        "-i".to_string(),
-        input.to_string_lossy().into_owned(),
+fn ffmpeg_args(
+    input: &Path,
+    output: &Path,
+    bitrate_kbps: i64,
+    range: Option<(f64, f64)>,
+) -> Vec<String> {
+    let mut args = vec!["-y".to_string()];
+
+    if let Some((start, _)) = range {
+        args.push("-ss".to_string());
+        args.push(format!("{start:.3}"));
+    }
+
+    args.push("-i".to_string());
+    args.push(input.to_string_lossy().into_owned());
+
+    if let Some((start, end)) = range {
+        args.push("-t".to_string());
+        args.push(format!("{:.3}", end - start));
+    }
+
+    args.extend([
         "-c:v".to_string(),
         "libx264".to_string(),
         "-preset".to_string(),
@@ -519,7 +545,9 @@ fn ffmpeg_args(input: &Path, output: &Path, bitrate_kbps: i64) -> Vec<String> {
         "-f".to_string(),
         "mp4".to_string(),
         output.to_string_lossy().into_owned(),
-    ]
+    ]);
+
+    args
 }
 
 /// Last non-empty line of ffmpeg's stderr, clipped to a readable length.

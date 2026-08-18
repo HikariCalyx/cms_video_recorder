@@ -59,6 +59,17 @@ word-unknown-error = 未知错误
 dialog-pick-folder = 选择保存位置
 dialog-save-compressed = 保存压缩视频
 
+# Trim dialog
+panel-trim = 裁剪片段
+trim-start = 开始 { $time }
+trim-end = 结束 { $time }
+trim-loading = 正在读取时长…
+trim-ready = 拖动两侧按钮选择片段，然后预览
+trim-no-duration = 无法读取视频时长
+trim-preview-error = 预览失败: { $error }
+btn-preview = 预览
+btn-stop-preview = 停止
+
 # MapleStory server aliases
 alias-live = 冒险岛正式服
 alias-test = 冒险岛测试服

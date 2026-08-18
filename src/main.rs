@@ -14,6 +14,7 @@ mod i18n;
 mod recorder;
 mod settings;
 mod toolbar;
+mod trim;
 mod videos;
 #[cfg(windows)]
 mod win32;

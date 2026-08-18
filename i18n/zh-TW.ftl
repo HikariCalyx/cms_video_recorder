@@ -59,6 +59,17 @@ word-unknown-error = 未知錯誤
 dialog-pick-folder = 選擇儲存位置
 dialog-save-compressed = 儲存壓縮影片
 
+# Trim dialog
+panel-trim = 裁剪片段
+trim-start = 開始 { $time }
+trim-end = 結束 { $time }
+trim-loading = 正在讀取時長…
+trim-ready = 拖曳兩側按鈕選擇片段，然後預覽
+trim-no-duration = 無法讀取影片時長
+trim-preview-error = 預覽失敗: { $error }
+btn-preview = 預覽
+btn-stop-preview = 停止
+
 # MapleStory server aliases
 alias-live = 新楓之谷
 alias-test = 新楓之谷測試服

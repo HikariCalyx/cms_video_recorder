@@ -10,10 +10,10 @@ use iced::{
     keyboard,
     widget::{
         button, checkbox, column, container, horizontal_space, image, mouse_area, pick_list, row,
-        scrollable, text, text_input,
+        scrollable, stack, text, text_input,
     },
-    window, Alignment, Background, Border, Color, Element, Font, Length, Shadow, Size, Subscription,
-    Task, Theme,
+    window, Alignment, Background, Border, Color, Element, Font, Length, Point, Shadow, Size,
+    Subscription, Task, Theme,
 };
 
 use crate::config::AppConfig;
@@ -68,6 +68,11 @@ pub const EXPANDED_HEIGHT: f32 = 320.0;
 pub const SETTINGS_HEIGHT: f32 = 300.0;
 /// Height when the recordings manager is expanded.
 pub const VIDEOS_HEIGHT: f32 = 320.0;
+/// Height when the trim panel is expanded.
+///
+/// The preview box (240 px), timeline, and controls add up to ~371 px, plus
+/// the 52 px toolbar strip and the 1 px separator above the panel body.
+pub const TRIM_HEIGHT: f32 = 430.0;
 
 // --- Timing ----------------------------------------------------------------
 
@@ -76,6 +81,9 @@ pub const VIDEOS_HEIGHT: f32 = 320.0;
 /// Fine-grained enough that the displayed second flips promptly, and the
 /// subscription only exists while recording or while a status is on screen.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the trim preview drains the decoded frame pipe while playing.
+const PREVIEW_TICK: Duration = Duration::from_millis(33);
 
 /// How long a "saved" or "failed" message stays on the toolbar.
 const STATUS_TTL: Duration = Duration::from_secs(6);
@@ -132,6 +140,24 @@ pub enum Message {
     CompressionFinished(crate::videos::CompressionReport),
     /// Cancel the running compression
     CancelCompression,
+    /// The clip's duration and size were read for the trim panel
+    TrimDurationProbed(PathBuf, Option<crate::trim::ProbeInfo>),
+    /// The start handle of the trim timeline was grabbed
+    TrimGrabStart,
+    /// The end handle of the trim timeline was grabbed
+    TrimGrabEnd,
+    /// The cursor moved over the trim timeline, dragging a handle
+    TrimDrag(Point),
+    /// The drag ended, or the cursor left the trim timeline
+    TrimDragEnd,
+    /// Play / stop the trim preview
+    TrimPlayToggle,
+    /// Proceed from the trim panel to the compression save dialog
+    TrimConfirm,
+    /// Leave the trim panel without compressing
+    TrimCancel,
+    /// The trim preview clock ticked; drains decoded frames
+    TrimTick,
     /// Reveal a clip in an Explorer window
     BrowseVideo(PathBuf),
     /// Delete a clip from disk
@@ -192,6 +218,8 @@ pub struct Toolbar {
     pub settings: SettingsState,
     /// The recordings manager and its list of clips.
     pub videos: VideosState,
+    /// The trim panel for clipping a segment out of a recording.
+    pub trim: crate::trim::TrimState,
     /// The live capture session, if any.
     recording: Option<Recording>,
     /// True while the encoder is spinning up, before capture begins.
@@ -254,6 +282,12 @@ impl Toolbar {
             }));
         }
 
+        // The preview is paced in real time by ffmpeg; the UI clock only
+        // drains the frame pipe while a preview is on screen.
+        if self.trim.playing && self.trim.preview.is_some() {
+            subscriptions.push(iced::time::every(PREVIEW_TICK).map(|_| Message::TrimTick));
+        }
+
         Subscription::batch(subscriptions)
     }
 
@@ -267,6 +301,8 @@ impl Toolbar {
             EXPANDED_HEIGHT
         } else if self.settings.is_open {
             SETTINGS_HEIGHT
+        } else if self.trim.is_open {
+            TRIM_HEIGHT
         } else if self.videos.is_open {
             VIDEOS_HEIGHT
         } else {
@@ -318,6 +354,55 @@ impl Toolbar {
         }
 
         self.status = Some((status, Instant::now()));
+    }
+
+    /// Leaves the trim panel, stopping any preview.
+    fn close_trim_panel(&mut self) {
+        if self.trim.is_open {
+            self.trim.stop_preview();
+            self.trim.is_open = false;
+        }
+    }
+
+    /// Marks the clip as busy and opens the save dialog for the compressed
+    /// file, exactly like a plain compress would.
+    fn ask_compress_target(&mut self, source: PathBuf) -> Task<Message> {
+        self.videos.compressing = Some(source.clone());
+        self.videos.session = Some(crate::videos::CompressionSession::default());
+
+        // The dialog opens on the clip's folder, with the name pre-filled.
+        let directory = source
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_default();
+        let suggested = format!(
+            "{}_compressed",
+            crate::videos::display_name(&file_name(&source))
+        );
+
+        let (sender, receiver) = oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::dialog::pick_save_file(&directory, &suggested));
+        });
+
+        Task::perform(
+            async move { receiver.await.unwrap_or(None) },
+            Message::CompressTargetPicked,
+        )
+    }
+
+    /// Timeline pixel position of a time, in seconds.
+    fn timeline_x(&self, time: f64) -> f32 {
+        if self.trim.duration <= 0.0 {
+            return 0.0;
+        }
+        ((time / self.trim.duration) as f32).clamp(0.0, 1.0) * crate::trim::TIMELINE_WIDTH
+    }
+
+    /// Time, in seconds, at a timeline pixel position.
+    fn timeline_time(&self, x: f32) -> f64 {
+        let fraction = (x / crate::trim::TIMELINE_WIDTH).clamp(0.0, 1.0) as f64;
+        self.trim.duration * fraction
     }
 
     /// Opens a capture session on the selected window.
@@ -475,6 +560,7 @@ impl Toolbar {
             Message::ToggleWindowPicker => {
                 // toggle() refreshes on open, which may drop a closed window.
                 self.picker.toggle();
+                self.close_trim_panel();
 
                 // Only one panel fits in the window at a time.
                 if self.picker.is_open {
@@ -594,6 +680,7 @@ impl Toolbar {
                 // Discard anything left over from a panel that was closed
                 // without saving.
                 self.settings.reset(&self.config);
+                self.close_trim_panel();
 
                 // Both panels share the window body.
                 if self.picker.is_open {
@@ -608,10 +695,12 @@ impl Toolbar {
                 if self.videos.is_open {
                     self.videos.is_open = false;
                     self.videos.pending_delete = None;
+                    self.close_trim_panel();
                     return self.sync_window_size();
                 }
 
                 self.videos.is_open = true;
+                self.close_trim_panel();
                 self.videos.refresh(&self.config.output_dir);
 
                 // Only one panel fits in the window at a time.
@@ -648,36 +737,30 @@ impl Toolbar {
                     return Task::none();
                 }
 
-                // Fail before asking for a location: if ffmpeg was deleted,
-                // the user should know there's nothing to compress with.
+                // Fail before opening the trim panel: if ffmpeg was deleted,
+                // there's nothing to compress (or preview) with.
                 if crate::videos::ffmpeg_path().is_none() {
                     self.set_status(Status::Failed(tr("error-ffmpeg-missing")));
                     return Task::none();
                 }
 
-                self.videos.compressing = Some(path.clone());
-                self.videos.session = Some(crate::videos::CompressionSession::default());
+                // The trim panel takes over the window body until the user
+                // confirms or cancels; its duration probe runs off-thread.
+                self.trim.open(path.clone());
 
-                // Ask where the compressed file should go. The dialog opens
-                // on the clip's folder, with the name pre-filled.
-                let directory = path
-                    .parent()
-                    .map(|parent| parent.to_path_buf())
-                    .unwrap_or_default();
-                let suggested = format!(
-                    "{}_compressed",
-                    crate::videos::display_name(&file_name(&path))
-                );
-
+                let probe_path = path.clone();
                 let (sender, receiver) = oneshot::channel();
                 std::thread::spawn(move || {
-                    let _ = sender.send(crate::dialog::pick_save_file(&directory, &suggested));
+                    let _ = sender.send(crate::trim::probe_clip(&probe_path));
                 });
 
-                return Task::perform(
-                    async move { receiver.await.unwrap_or(None) },
-                    Message::CompressTargetPicked,
-                );
+                return Task::batch([
+                    Task::perform(
+                        async move { (path, receiver.await.unwrap_or(None)) },
+                        |(path, info)| Message::TrimDurationProbed(path, info),
+                    ),
+                    self.sync_window_size(),
+                ]);
             }
             Message::CompressTargetPicked(destination) => {
                 let Some(source) = self.videos.compressing.take() else {
@@ -713,8 +796,10 @@ impl Toolbar {
                     return Task::none();
                 }
 
-                // Keep the busy marker through the encode itself.
+                // Keep the busy marker through the encode itself, and carry
+                // the trim panel's selection into the pass.
                 self.videos.compressing = Some(source.clone());
+                let range = self.trim.range();
 
                 let (sender, receiver) = oneshot::channel();
                 std::thread::spawn(move || {
@@ -722,6 +807,7 @@ impl Toolbar {
                         &source,
                         &destination,
                         &session,
+                        range,
                     ));
                 });
 
@@ -765,6 +851,155 @@ impl Toolbar {
                 // and reports back; stay busy until it does.
                 if let Some(session) = &self.videos.session {
                     session.cancel();
+                }
+            }
+            Message::TrimDurationProbed(path, info) => {
+                // The user may have left the panel or opened another clip
+                // while ffmpeg was starting; a stale result must not apply.
+                if !self.trim.is_open || self.trim.source.as_deref() != Some(path.as_path()) {
+                    return Task::none();
+                }
+
+                match info {
+                    Some(info) if info.duration > 0.0 => {
+                        self.trim.duration = info.duration;
+                        self.trim.video_size = Some(info.preview_size());
+                        self.trim.start = 0.0;
+                        self.trim.end = info.duration;
+                        self.trim.playhead = 0.0;
+                    }
+                    _ => {
+                        self.trim.duration = 0.0;
+                        self.trim.error = Some(tr("trim-no-duration"));
+                    }
+                }
+            }
+            Message::TrimGrabStart => {
+                if self.trim.duration <= 0.0 {
+                    return Task::none();
+                }
+
+                // Dragging redefines the segment, so a running preview no
+                // longer matches what's selected.
+                self.trim.dragging = Some(crate::trim::TrimHandle::Start);
+                self.trim.stop_preview();
+            }
+            Message::TrimGrabEnd => {
+                if self.trim.duration <= 0.0 {
+                    return Task::none();
+                }
+
+                self.trim.dragging = Some(crate::trim::TrimHandle::End);
+                self.trim.stop_preview();
+            }
+            Message::TrimDrag(point) => {
+                let Some(handle) = self.trim.dragging else {
+                    return Task::none();
+                };
+
+                let time = self.timeline_time(point.x);
+                match handle {
+                    crate::trim::TrimHandle::Start => {
+                        self.trim.start =
+                            time.min(self.trim.end - crate::trim::MIN_SEGMENT);
+                        self.trim.playhead = self.trim.start;
+                    }
+                    crate::trim::TrimHandle::End => {
+                        self.trim.end =
+                            time.max(self.trim.start + crate::trim::MIN_SEGMENT);
+                    }
+                }
+            }
+            Message::TrimDragEnd => {
+                self.trim.dragging = None;
+            }
+            Message::TrimPlayToggle => {
+                if self.trim.playing {
+                    self.trim.stop_preview();
+                } else {
+                    // A decode failure shows in the box; retrying starts
+                    // over with a clean slate.
+                    self.trim.error = None;
+                    if let Err(error) = self.trim.start_preview() {
+                        self.set_status(Status::Failed(error));
+                    }
+                }
+            }
+            Message::TrimConfirm => {
+                let Some(source) = self.trim.source.clone() else {
+                    return Task::none();
+                };
+
+                // The panel can stay open while a recording is started via
+                // the hotkey, so re-check before committing.
+                if self.is_recording() {
+                    self.set_status(Status::Info(tr("status-stop-before-compress")));
+                    return Task::none();
+                }
+                if self.videos.compressing.is_some() {
+                    self.set_status(Status::Info(tr("status-already-compressing")));
+                    return Task::none();
+                }
+                if crate::videos::ffmpeg_path().is_none() {
+                    self.set_status(Status::Failed(tr("error-ffmpeg-missing")));
+                    return Task::none();
+                }
+
+                self.trim.stop_preview();
+                self.trim.is_open = false;
+
+                return Task::batch([
+                    self.ask_compress_target(source),
+                    self.sync_window_size(),
+                ]);
+            }
+            Message::TrimCancel => {
+                self.close_trim_panel();
+                return self.sync_window_size();
+            }
+            Message::TrimTick => {
+                let Some(preview) = self.trim.preview.as_ref() else {
+                    return Task::none();
+                };
+
+                let receiver = preview.rx.clone();
+                let mut events: Vec<crate::trim::PreviewEvent> = Vec::new();
+                if let Ok(receiver) = receiver.lock() {
+                    while let Ok(event) = receiver.try_recv() {
+                        events.push(event);
+                    }
+                }
+
+                let mut ended = false;
+                let mut failed: Option<String> = None;
+                for event in events {
+                    match event {
+                        crate::trim::PreviewEvent::Frame(frame) => {
+                            self.trim.frame = Some(frame);
+                        }
+                        crate::trim::PreviewEvent::Ended => ended = true,
+                        crate::trim::PreviewEvent::Failed(error) => failed = Some(error),
+                    }
+                }
+
+                if let Some(error) = failed {
+                    self.trim.error =
+                        Some(tr_arg("trim-preview-error", "error", error));
+                    self.trim.stop_preview();
+                    return Task::none();
+                }
+
+                if ended {
+                    self.trim.playhead = self.trim.end;
+                    self.trim.stop_preview();
+                    return Task::none();
+                }
+
+                if self.trim.playing {
+                    if let Some(started) = self.trim.play_started {
+                        let position = self.trim.start + started.elapsed().as_secs_f64();
+                        self.trim.playhead = position.min(self.trim.end);
+                    }
                 }
             }
             Message::BrowseVideo(path) => {
@@ -911,6 +1146,8 @@ impl Toolbar {
             Some(self.picker_panel())
         } else if self.settings.is_open {
             Some(self.settings_panel())
+        } else if self.trim.is_open {
+            Some(self.trim_panel())
         } else if self.videos.is_open {
             Some(self.videos_panel())
         } else {
@@ -1468,6 +1705,139 @@ impl Toolbar {
             .into()
     }
 
+    /// The trim panel: a preview of the selected segment, a two-handle
+    /// timeline, and a play/stop button to check it.
+    fn trim_panel(&self) -> Element<'_, Message> {
+        let trim = &self.trim;
+        let can_preview = trim.duration > 0.0;
+        let can_confirm = can_preview && trim.end - trim.start >= crate::trim::MIN_SEGMENT;
+
+        let header = row![
+            text(tr("panel-trim"))
+                .size(11)
+                .font(UI_FONT_BOLD)
+                .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
+            horizontal_space(),
+            small_button(tr("btn-cancel"), Message::TrimCancel),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // --- Preview box ---
+        let preview: Element<Message> = if let Some(frame) = &trim.frame {
+            image(image::Handle::from_rgba(
+                frame.width,
+                frame.height,
+                frame.pixels.clone(),
+            ))
+            .width(Length::Fixed(frame.width as f32))
+            .height(Length::Fixed(frame.height as f32))
+            .into()
+        } else if let Some(error) = &trim.error {
+            container(
+                text(error.as_str())
+                    .size(11)
+                    .color(Color::from_rgb8(0xE8, 0x7A, 0x7A))
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill)
+            .into()
+        } else if trim.duration <= 0.0 {
+            container(
+                text(tr("trim-loading"))
+                    .size(12)
+                    .color(Color::from_rgb8(0x7A, 0x7A, 0x86)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill)
+            .into()
+        } else {
+            container(
+                text(tr("trim-ready"))
+                    .size(12)
+                    .color(Color::from_rgb8(0x7A, 0x7A, 0x86)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill)
+            .into()
+        };
+
+        let preview_box = container(preview)
+            .width(Length::Fill)
+            .height(Length::Fixed(crate::trim::PREVIEW_MAX_HEIGHT as f32))
+            .style(trim_box_style)
+            .clip(true)
+            .center_x(Length::Fill);
+
+        // --- Time readouts ---
+        let times = row![
+            text(tr_arg("trim-start", "time", trim_time(trim.start)))
+                .size(11)
+                .color(Color::from_rgb8(0x7E, 0x7E, 0x8A)),
+            horizontal_space(),
+            text(tr_arg("trim-end", "time", trim_time(trim.end)))
+                .size(11)
+                .color(Color::from_rgb8(0x7E, 0x7E, 0x8A)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // --- Two-handle timeline ---
+        let start_x = self.timeline_x(trim.start);
+        let end_x = self.timeline_x(trim.end);
+        let playhead_x = self.timeline_x(trim.playhead);
+
+        let timeline = mouse_area(
+            stack![
+                trim_track_layer(),
+                trim_range_layer(start_x, end_x),
+                trim_playhead_layer(playhead_x),
+                trim_handle_layer(start_x, Message::TrimGrabStart),
+                trim_handle_layer(end_x, Message::TrimGrabEnd),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fixed(crate::trim::TIMELINE_HEIGHT)),
+        )
+        .on_move(Message::TrimDrag)
+        .on_release(Message::TrimDragEnd)
+        .on_exit(Message::TrimDragEnd);
+
+        // --- Controls ---
+        let controls = row![
+            small_button_maybe(
+                if trim.playing {
+                    tr("btn-stop-preview")
+                } else {
+                    tr("btn-preview")
+                },
+                can_preview.then_some(Message::TrimPlayToggle),
+            ),
+            text(format!("{} – {}", trim_time(trim.start), trim_time(trim.end)))
+                .size(11)
+                .color(Color::from_rgb8(0x9C, 0xB8, 0xF0)),
+            horizontal_space(),
+            small_button_maybe(
+                tr("btn-compress"),
+                can_confirm.then_some(Message::TrimConfirm),
+            ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let panel = column![header, preview_box, times, timeline, controls]
+            .spacing(6)
+            .padding([8, 12]);
+
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     /// The assigned shortcut, as one cap per key.
     ///
     /// Stays on screen while the field is armed – the caps just dim – so the
@@ -1689,6 +2059,134 @@ fn grip_bar<'a>() -> Element<'a, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// A fixed-width spacer for the trim timeline's overlay layers.
+fn trim_spacer(width: f32) -> Element<'static, Message> {
+    container(horizontal_space())
+        .width(Length::Fixed(width))
+        .height(Length::Fill)
+        .into()
+}
+
+/// The trim timeline's base track, vertically centered.
+fn trim_track_layer() -> Element<'static, Message> {
+    container(
+        container(horizontal_space())
+            .width(Length::Fill)
+            .height(Length::Fixed(6.0))
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0x2A, 0x2A, 0x32))),
+                border: Border {
+                    color: Color::from_rgb8(0x3A, 0x3A, 0x42),
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            }),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(crate::trim::TIMELINE_HEIGHT))
+    .center_y(Length::Fill)
+    .into()
+}
+
+/// The selected segment, highlighted on the trim timeline track.
+fn trim_range_layer(x_start: f32, x_end: f32) -> Element<'static, Message> {
+    row![
+        trim_spacer(x_start),
+        container(horizontal_space())
+            .width(Length::Fixed((x_end - x_start).max(0.0)))
+            .height(Length::Fixed(6.0))
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0xE8, 0x8A, 0x2A))),
+                ..Default::default()
+            }),
+    ]
+    .height(Length::Fill)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The trim timeline playhead, a thin line over the track.
+fn trim_playhead_layer(x: f32) -> Element<'static, Message> {
+    row![
+        trim_spacer((x - 1.0).max(0.0)),
+        container(horizontal_space())
+            .width(Length::Fixed(2.0))
+            .height(Length::Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0xDC, 0xDC, 0xE4))),
+                ..Default::default()
+            }),
+    ]
+    .height(Length::Fill)
+    .into()
+}
+
+/// One draggable knob of the trim timeline.
+///
+/// The visual knob is `KNOB_WIDTH` wide; an invisible padding ring widens
+/// the grab target so the handles stay easy to hit.
+fn trim_handle_layer(x: f32, grab: Message) -> Element<'static, Message> {
+    let hit_pad = 8.0;
+    let total_width = crate::trim::KNOB_WIDTH + hit_pad * 2.0;
+    let left = (x - total_width / 2.0).clamp(0.0, crate::trim::TIMELINE_WIDTH - total_width);
+
+    row![
+        trim_spacer(left),
+        mouse_area(
+            container(
+                container(horizontal_space())
+                    .width(Length::Fixed(crate::trim::KNOB_WIDTH))
+                    .height(Length::Fixed(18.0))
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(Color::from_rgb8(
+                            0xFF, 0x9D, 0x00,
+                        ))),
+                        border: Border {
+                            color: Color::WHITE,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+            )
+            .padding([0.0, hit_pad]),
+        )
+        .on_press(grab),
+    ]
+    .height(Length::Fill)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The trim preview box: black, like a paused player.
+fn trim_box_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb8(0x10, 0x10, 0x14))),
+        border: Border {
+            color: Color::from_rgb8(0x3A, 0x3A, 0x42),
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// `01:23.4` – one decimal place, so handle drags give precise feedback.
+fn trim_time(secs: f64) -> String {
+    let total = secs.max(0.0);
+    let whole_minutes = (total / 60.0).floor() as u64;
+    let hours = whole_minutes / 60;
+    let minutes = whole_minutes % 60;
+    let seconds = total - (whole_minutes as f64 * 60.0);
+
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:04.1}")
+    } else {
+        format!("{minutes:02}:{seconds:04.1}")
+    }
 }
 
 /// Red circle used for the idle Record button, dimmed when unavailable
