@@ -17,6 +17,7 @@ use iced::{
 };
 
 use crate::config::AppConfig;
+use crate::i18n::{tr, tr_arg, Language};
 use crate::recorder::{self, Recording};
 use crate::settings::{self, Capture, SettingsState};
 use crate::videos::VideosState;
@@ -64,7 +65,7 @@ pub const EXPANDED_HEIGHT: f32 = 320.0;
 ///
 /// Sized to the form's natural height – the panel doesn't scroll, so anything
 /// shorter squeezes the fields.
-pub const SETTINGS_HEIGHT: f32 = 284.0;
+pub const SETTINGS_HEIGHT: f32 = 300.0;
 /// Height when the recordings manager is expanded.
 pub const VIDEOS_HEIGHT: f32 = 320.0;
 
@@ -157,6 +158,8 @@ pub enum Message {
     Hotkey(crate::hotkey::Event),
     /// Write the edited settings to disk
     SaveSettings,
+    /// The display language was chosen in the settings panel
+    SelectLanguage(Language),
     /// Close the application
     Close,
 }
@@ -209,6 +212,7 @@ impl Toolbar {
     /// Builds the initial state from the config file.
     pub fn new() -> (Self, Task<Message>) {
         let config = AppConfig::load();
+        crate::i18n::init(config.language);
 
         let mut toolbar = Self {
             config,
@@ -306,6 +310,13 @@ impl Toolbar {
     }
 
     fn set_status(&mut self, status: Status) {
+        // The toolbar can only hold a one-line, truncated summary, so debug
+        // builds also print the full message to the console.
+        #[cfg(debug_assertions)]
+        if let Status::Failed(reason) = &status {
+            eprintln!("[error] {reason}");
+        }
+
         self.status = Some((status, Instant::now()));
     }
 
@@ -319,7 +330,7 @@ impl Toolbar {
         let Some(target) = self.picker.selected.as_ref() else {
             // Reachable from the hotkey, which doesn't know the Record button
             // is disabled.
-            self.set_status(Status::Failed("请先选择窗口".to_string()));
+            self.set_status(Status::Failed(tr("status-pick-window")));
             return Task::none();
         };
 
@@ -343,7 +354,7 @@ impl Toolbar {
         Task::perform(
             async move {
                 receiver.await.unwrap_or_else(|_| {
-                    Err(recorder::Error::Capture("录制线程意外结束".to_string()))
+                    Err(recorder::Error::Capture(tr("error-record-thread")))
                 })
             },
             Message::RecordingStarted,
@@ -370,7 +381,7 @@ impl Toolbar {
         Task::perform(
             async move {
                 receiver.await.unwrap_or_else(|_| {
-                    Err(recorder::Error::Capture("录制线程意外结束".to_string()))
+                    Err(recorder::Error::Capture(tr("error-record-thread")))
                 })
             },
             Message::RecordingFinished,
@@ -395,15 +406,24 @@ impl Toolbar {
             return Task::none();
         }
 
+        let language_changed = updated.language != self.config.language;
         let rebind = updated.hotkey != self.config.hotkey;
         self.config = updated;
+
+        if language_changed {
+            crate::i18n::set(self.config.language);
+
+            // Window aliases come from the active locale, so re-enumerate to
+            // relabel what's already listed.
+            self.picker.refresh();
+        }
 
         if rebind {
             crate::hotkey::apply(self.config.hotkey);
         }
 
         if let Err(error) = self.config.save() {
-            self.set_status(Status::Failed(format!("设置未保存: {error}")));
+            self.set_status(Status::Failed(tr_arg("error-settings-save", "error", error)));
         }
 
         Task::none()
@@ -611,29 +631,27 @@ impl Toolbar {
             }
             Message::PlayVideo(path) => {
                 if let Err(error) = crate::videos::play(&path) {
-                    self.set_status(Status::Failed(format!("播放失败: {error}")));
+                    self.set_status(Status::Failed(tr_arg("error-play", "error", error)));
                 }
             }
             Message::CompressVideo(path) => {
                 // The encoder is already busy capturing; don't stack a
                 // software encode on top of a live recording.
                 if self.is_recording() {
-                    self.set_status(Status::Info("请先停止录制再压缩".to_string()));
+                    self.set_status(Status::Info(tr("status-stop-before-compress")));
                     return Task::none();
                 }
 
                 // One pass at a time.
                 if self.videos.compressing.is_some() {
-                    self.set_status(Status::Info("已有视频正在压缩".to_string()));
+                    self.set_status(Status::Info(tr("status-already-compressing")));
                     return Task::none();
                 }
 
                 // Fail before asking for a location: if ffmpeg was deleted,
                 // the user should know there's nothing to compress with.
                 if crate::videos::ffmpeg_path().is_none() {
-                    self.set_status(Status::Failed(
-                        "未找到 ffmpeg.exe，请放回程序目录".to_string(),
-                    ));
+                    self.set_status(Status::Failed(tr("error-ffmpeg-missing")));
                     return Task::none();
                 }
 
@@ -677,7 +695,7 @@ impl Toolbar {
                     self.videos.session = None;
 
                     if was_cancelled {
-                        self.set_status(Status::Info("已取消压缩".to_string()));
+                        self.set_status(Status::Info(tr("status-compress-cancelled")));
                     }
                     return Task::none();
                 };
@@ -691,7 +709,7 @@ impl Toolbar {
                 if session.is_cancelled() {
                     self.videos.compressing = None;
                     self.videos.session = None;
-                    self.set_status(Status::Info("已取消压缩".to_string()));
+                    self.set_status(Status::Info(tr("status-compress-cancelled")));
                     return Task::none();
                 }
 
@@ -710,9 +728,7 @@ impl Toolbar {
                 return Task::perform(
                     async move {
                         receiver.await.unwrap_or_else(|_| {
-                            crate::videos::CompressionReport::Failed(
-                                "压缩线程意外结束".to_string(),
-                            )
+                            crate::videos::CompressionReport::Failed(tr("error-compress-thread"))
                         })
                     },
                     Message::CompressionFinished,
@@ -726,17 +742,17 @@ impl Toolbar {
                     crate::videos::CompressionReport::Done(outcome) => {
                         let size = crate::videos::human_size(outcome.size);
                         let message = if outcome.reached_target {
-                            format!("已压缩到 {size}")
+                            tr_arg("status-compressed", "size", size)
                         } else {
-                            format!("已压缩到 {size}（未达 5000KB）")
+                            tr_arg("status-compressed-partial", "size", size)
                         };
                         self.set_status(Status::Compressed(message));
                     }
                     crate::videos::CompressionReport::Failed(error) => {
-                        self.set_status(Status::Failed(format!("压缩失败: {error}")));
+                        self.set_status(Status::Failed(tr_arg("error-compress", "error", error)));
                     }
                     crate::videos::CompressionReport::Cancelled => {
-                        self.set_status(Status::Info("已取消压缩".to_string()));
+                        self.set_status(Status::Info(tr("status-compress-cancelled")));
                     }
                 }
 
@@ -753,7 +769,7 @@ impl Toolbar {
             }
             Message::BrowseVideo(path) => {
                 if let Err(error) = crate::videos::browse(&path) {
-                    self.set_status(Status::Failed(format!("打开失败: {error}")));
+                    self.set_status(Status::Failed(tr_arg("error-open", "error", error)));
                 }
             }
             Message::DeleteVideo(path) => {
@@ -777,7 +793,7 @@ impl Toolbar {
                         }
                     }
                     Err(error) => {
-                        self.set_status(Status::Failed(format!("删除失败: {error}")));
+                        self.set_status(Status::Failed(tr_arg("error-delete", "error", error)));
                     }
                 }
             }
@@ -854,6 +870,10 @@ impl Toolbar {
                 // the cog again – it just reads as a confirmation.
                 return Task::batch([self.close_settings(), self.sync_window_size()]);
             }
+            Message::SelectLanguage(language) => {
+                self.settings.language = language;
+                return self.commit_settings();
+            }
             Message::Hotkey(event) => match event {
                 crate::hotkey::Event::Pressed => {
                     return self.update(Message::ToggleRecording);
@@ -863,9 +883,13 @@ impl Toolbar {
                     // it tells the user which one to change.
                     let combination = match self.config.hotkey {
                         Some(hotkey) => hotkey.label(),
-                        None => "快捷键".to_string(),
+                        None => tr("word-hotkey"),
                     };
-                    self.set_status(Status::Failed(format!("{combination} 已被占用")));
+                    self.set_status(Status::Failed(tr_arg(
+                        "error-hotkey-taken",
+                        "combination",
+                        combination,
+                    )));
                 }
             },
             Message::Close => {
@@ -964,21 +988,21 @@ impl Toolbar {
 
         let (indicator, label, style): (Element<Message>, String, ButtonStyleFn) = if self.starting
         {
-            (record_dot(true), "准备中".to_string(), record_idle_style)
+            (record_dot(true), tr("btn-preparing"), record_idle_style)
         } else if self.stopping {
-            (stop_square(), "保存中".to_string(), record_active_style)
+            (stop_square(), tr("btn-saving"), record_active_style)
         } else if self.is_recording() {
             // Zero-padding keeps the label the same width all the way down, so
             // the button doesn't twitch as the countdown crosses ten seconds.
             (
                 stop_square(),
-                format!("停止 {}", self.recording_clock()),
+                tr_arg("btn-stop", "clock", self.recording_clock()),
                 record_active_style,
             )
         } else {
             (
                 record_dot(can_record),
-                "录制".to_string(),
+                tr("btn-record"),
                 record_idle_style,
             )
         };
@@ -1081,11 +1105,11 @@ impl Toolbar {
 
         let (message, color) = match status {
             Status::Saved(path) => (
-                format!("已保存 {}", file_name(path)),
+                tr_arg("status-saved", "name", file_name(path)),
                 Color::from_rgb8(0x7E, 0xC8, 0x8A),
             ),
             Status::Deleted(name) => (
-                format!("已删除 {name}"),
+                tr_arg("status-deleted", "name", name),
                 Color::from_rgb8(0x7E, 0xC8, 0x8A),
             ),
             Status::Compressed(message) => (message.clone(), Color::from_rgb8(0x7E, 0xC8, 0x8A)),
@@ -1103,19 +1127,23 @@ impl Toolbar {
     /// The expandable list of capturable windows
     fn picker_panel(&self) -> Element<'_, Message> {
         let header = row![
-            text(format!("{} 个窗口", self.picker.windows.len()))
-                .size(11)
-                .font(UI_FONT_BOLD)
-                .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
+            text(tr_arg(
+                "picker-window-count",
+                "count",
+                self.picker.windows.len().to_string(),
+            ))
+            .size(11)
+            .font(UI_FONT_BOLD)
+            .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
             horizontal_space(),
-            small_button("刷新", Message::RefreshWindows),
+            small_button(tr("btn-refresh"), Message::RefreshWindows),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
 
         // The allow-list is the MapleStory family; this checkbox lets other
         // applications through for testing or one-off captures.
-        let filter_row = checkbox("显示其他窗口", self.picker.include_others)
+        let filter_row = checkbox(tr("picker-show-others"), self.picker.include_others)
             .on_toggle(Message::ToggleOtherWindows)
             .text_size(11)
             .style(picker_checkbox_style);
@@ -1123,9 +1151,9 @@ impl Toolbar {
         let list: Element<Message> = if self.picker.windows.is_empty() {
             container(
                 text(if self.picker.include_others {
-                    "未找到可捕获窗口"
+                    tr("picker-no-windows")
                 } else {
-                    "未找到置于前台的冒险岛窗口"
+                    tr("picker-no-maplestory")
                 })
                     .size(12)
                     .color(Color::from_rgb8(0x7A, 0x7A, 0x86)),
@@ -1190,7 +1218,10 @@ impl Toolbar {
         let mut panel = column![header, filter_row, list].spacing(8).padding([8, 12]);
 
         if self.picker.selected.is_some() {
-            panel = panel.push(small_button("清除选择", Message::ClearSelection));
+            panel = panel.push(small_button(
+                tr("picker-clear-selection"),
+                Message::ClearSelection,
+            ));
         }
 
         container(panel)
@@ -1202,26 +1233,26 @@ impl Toolbar {
     /// The expandable settings form
     fn settings_panel(&self) -> Element<'_, Message> {
         let header = row![
-            text("设置")
+            text(tr("panel-settings"))
                 .size(11)
                 .font(UI_FONT_BOLD)
                 .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
             horizontal_space(),
-            small_button("完成", Message::SaveSettings),
+            small_button(tr("btn-done"), Message::SaveSettings),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
 
         // --- Output directory ---
         let path_row = row![
-            text_input("保存位置", &self.settings.output_dir)
+            text_input(&tr("field-output-dir"), &self.settings.output_dir)
                 .on_input(Message::OutputDirChanged)
                 .on_submit(Message::SaveSettings)
                 .style(field_style)
                 .size(12)
                 .padding([6, 8])
                 .width(Length::Fill),
-            small_button("浏览…", Message::BrowseOutputDir),
+            small_button(tr("btn-browse"), Message::BrowseOutputDir),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -1236,8 +1267,8 @@ impl Toolbar {
                 .padding([6, 8])
                 .width(Length::Fixed(72.0)),
             text(match self.config.max_duration() {
-                Some(_) => "秒后自动停止".to_string(),
-                None => "秒，0 表示不限时长".to_string(),
+                Some(_) => tr("hint-duration-capped"),
+                None => tr("hint-duration-unlimited"),
             })
             .size(11)
             .color(Color::from_rgb8(0x7E, 0x7E, 0x8A)),
@@ -1255,37 +1286,48 @@ impl Toolbar {
             .push(horizontal_space())
             .push(small_button(
                 if self.settings.capturing {
-                    "取消"
+                    tr("btn-cancel")
                 } else {
-                    "修改"
+                    tr("btn-change")
                 },
                 Message::CaptureHotkey,
             ));
 
         if self.settings.hotkey.is_some() && !self.settings.capturing {
-            hotkey_row = hotkey_row.push(small_button("清除", Message::ClearHotkey));
+            hotkey_row = hotkey_row.push(small_button(tr("btn-clear"), Message::ClearHotkey));
         }
 
         let hotkey_hint = text(if self.settings.capturing {
-            "按下新的组合键；Esc 取消，Backspace 清除"
+            tr("hint-hotkey-capturing")
         } else {
-            "全局有效，游戏窗口在前台也能触发"
+            tr("hint-hotkey-global")
         })
         .size(10)
         .color(Color::from_rgb8(0x7E, 0x7E, 0x8A))
         .wrapping(text::Wrapping::None);
 
+        let mut language_row = row![].spacing(6).align_y(Alignment::Center);
+        for language in Language::ALL {
+            language_row = language_row.push(language_button(
+                language.label().to_string(),
+                self.settings.language == language,
+                Message::SelectLanguage(language),
+            ));
+        }
+
         let panel = column![
             header,
-            field_label("保存位置"),
+            field_label(tr("field-output-dir")),
             path_row,
-            field_label("最长录制时间"),
+            field_label(tr("field-max-duration")),
             duration_row,
-            field_label("录制 / 停止快捷键"),
+            field_label(tr("field-record-hotkey")),
             hotkey_row,
             hotkey_hint,
+            field_label(tr("field-language")),
+            language_row,
             horizontal_space(),
-            text(format!("配置文件: {}", crate::config::config_dir_display()))
+            text(tr_arg("label-config-file", "path", crate::config::config_dir_display()))
                 .size(9)
                 .color(Color::from_rgb8(0x60, 0x60, 0x6C))
                 .wrapping(text::Wrapping::None),
@@ -1303,19 +1345,23 @@ impl Toolbar {
     /// first, each with its actions.
     fn videos_panel(&self) -> Element<'_, Message> {
         let header = row![
-            text(format!("{} 个视频", self.videos.videos.len()))
-                .size(11)
-                .font(UI_FONT_BOLD)
-                .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
+            text(tr_arg(
+                "videos-count",
+                "count",
+                self.videos.videos.len().to_string(),
+            ))
+            .size(11)
+            .font(UI_FONT_BOLD)
+            .color(Color::from_rgb8(0x8A, 0x8A, 0x96)),
             horizontal_space(),
-            small_button("刷新", Message::RefreshVideos),
+            small_button(tr("btn-refresh"), Message::RefreshVideos),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
 
         let list: Element<Message> = if self.videos.videos.is_empty() {
             container(
-                text("暂无录制视频")
+                text(tr("videos-empty"))
                     .size(12)
                     .color(Color::from_rgb8(0x7A, 0x7A, 0x86)),
             )
@@ -1344,10 +1390,10 @@ impl Toolbar {
                     // hidden while the file is being rewritten, and the pass
                     // can be cancelled.
                     row![
-                        text("压缩中…")
+                        text(tr("status-compressing"))
                             .size(11)
                             .color(Color::from_rgb8(0x9C, 0xB8, 0xF0)),
-                        small_button("取消", Message::CancelCompression),
+                        small_button(tr("btn-cancel"), Message::CancelCompression),
                     ]
                     .spacing(4)
                     .align_y(Alignment::Center)
@@ -1355,11 +1401,11 @@ impl Toolbar {
                     // Inline confirmation in place of a modal: the row's
                     // actions are swapped until 确认 or 取消 is pressed.
                     row![
-                        text("确认删除?")
+                        text(tr("confirm-delete"))
                             .size(11)
                             .color(Color::from_rgb8(0xE8, 0x7A, 0x7A)),
-                        small_danger_button("删除", Message::ConfirmDeleteVideo),
-                        small_button("取消", Message::CancelDeleteVideo),
+                        small_danger_button(tr("btn-delete"), Message::ConfirmDeleteVideo),
+                        small_button(tr("btn-cancel"), Message::CancelDeleteVideo),
                     ]
                     .spacing(4)
                     .align_y(Alignment::Center)
@@ -1367,16 +1413,19 @@ impl Toolbar {
                     // While a compression is running, the other rows'
                     // compress buttons dim out instead of queueing.
                     row![
-                        small_button("播放", Message::PlayVideo(entry.path.clone())),
+                        small_button(tr("btn-play"), Message::PlayVideo(entry.path.clone())),
                         small_button_maybe(
-                            "压缩",
+                            tr("btn-compress"),
                             self.videos
                                 .compressing
                                 .is_none()
                                 .then_some(Message::CompressVideo(entry.path.clone())),
                         ),
-                        small_button("浏览", Message::BrowseVideo(entry.path.clone())),
-                        small_danger_button("删除", Message::DeleteVideo(entry.path.clone())),
+                        small_button(
+                            tr("btn-show-folder"),
+                            Message::BrowseVideo(entry.path.clone()),
+                        ),
+                        small_danger_button(tr("btn-delete"), Message::DeleteVideo(entry.path.clone())),
                     ]
                     .spacing(4)
                     .align_y(Alignment::Center)
@@ -1426,9 +1475,9 @@ impl Toolbar {
     fn hotkey_display(&self) -> Element<'_, Message> {
         let Some(hotkey) = self.settings.hotkey else {
             let (label, color) = if self.settings.capturing {
-                ("等待按键…", Color::from_rgb8(0x9C, 0xB8, 0xF0))
+                (tr("hotkey-waiting"), Color::from_rgb8(0x9C, 0xB8, 0xF0))
             } else {
-                ("未设置", Color::from_rgb8(0x7E, 0x7E, 0x8A))
+                (tr("hotkey-unset"), Color::from_rgb8(0x7E, 0x7E, 0x8A))
             };
 
             return text(label)
@@ -1501,7 +1550,7 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{kept}\u{2026}")
 }
 
-fn small_button(label: &str, msg: Message) -> Element<'_, Message> {
+fn small_button(label: String, msg: Message) -> Element<'static, Message> {
     button(text(label).size(11))
         .style(subtle_button_style)
         .on_press(msg)
@@ -1510,7 +1559,7 @@ fn small_button(label: &str, msg: Message) -> Element<'_, Message> {
 }
 
 /// A small destructive button, e.g. the clip's "删除".
-fn small_danger_button(label: &str, msg: Message) -> Element<'_, Message> {
+fn small_danger_button(label: String, msg: Message) -> Element<'static, Message> {
     button(text(label).size(11))
         .style(danger_button_style)
         .on_press(msg)
@@ -1519,10 +1568,23 @@ fn small_danger_button(label: &str, msg: Message) -> Element<'_, Message> {
 }
 
 /// A small button that may be disabled by passing `None`.
-fn small_button_maybe(label: &str, msg: Option<Message>) -> Element<'_, Message> {
+fn small_button_maybe(label: String, msg: Option<Message>) -> Element<'static, Message> {
     button(text(label).size(11))
         .style(subtle_button_style)
         .on_press_maybe(msg)
+        .padding([4, 9])
+        .into()
+}
+
+/// One choice in the settings panel's language row.
+fn language_button<'a>(label: String, active: bool, msg: Message) -> Element<'a, Message> {
+    button(text(label).size(11))
+        .style(if active {
+            language_active_style
+        } else {
+            subtle_button_style
+        })
+        .on_press(msg)
         .padding([4, 9])
         .into()
 }
@@ -1538,7 +1600,7 @@ fn list_scrollable<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, 
 }
 
 /// Caption above a settings field.
-fn field_label<'a>(label: &'a str) -> Element<'a, Message> {
+fn field_label(label: String) -> Element<'static, Message> {
     text(label)
         .size(10)
         .color(Color::from_rgb8(0x8A, 0x8A, 0x96))
@@ -1899,6 +1961,16 @@ fn list_item_style(_theme: &Theme, status: button::Status) -> button::Style {
 }
 
 fn list_item_selected_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = if is_active(status) {
+        Color::from_rgb8(0x3D, 0x74, 0xE8)
+    } else {
+        Color::from_rgb8(0x2F, 0x62, 0xD4)
+    };
+    rounded(5.0, bg, Color::WHITE)
+}
+
+/// Highlighted while it is the currently selected language.
+fn language_active_style(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = if is_active(status) {
         Color::from_rgb8(0x3D, 0x74, 0xE8)
     } else {

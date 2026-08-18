@@ -20,27 +20,30 @@ use windows::{
     },
 };
 
-/// Executables that may be captured, each mapped to a display alias.
+/// Executables that may be captured, each mapped to the FTL key of its
+/// display alias.
 ///
 /// This table doubles as the allow-list: a window whose owning process is not
 /// listed here is never offered as a capture target. Keys are compared
 /// case-insensitively against the process image file name.
 pub const PROCESS_ALIASES: &[(&str, &str)] = &[
-    ("maplestory.exe", "冒险岛正式服"),
-    ("maplestoryt.exe", "冒险岛测试服"),
-    ("maplestoryta.exe", "冒险岛测试服"),
-    ("maplestorym.exe", "冒险岛M"),
-    ("maplestoryn.exe", "冒险岛N"),
-    ("maplestory_classic.exe", "冒险岛怀旧服"),
-    ("msw.exe", "冒险岛世界"),
+    ("maplestory.exe", "alias-live"),
+    ("maplestoryt.exe", "alias-test"),
+    ("maplestoryta.exe", "alias-test"),
+    ("maplestorym.exe", "alias-m"),
+    ("maplestoryn.exe", "alias-n"),
+    ("maplestory_classic.exe", "alias-classic"),
+    ("msw.exe", "alias-worlds"),
 ];
 
-/// Look up the display alias for an executable name.
-pub fn alias_for(exe_name: &str) -> Option<&'static str> {
-    PROCESS_ALIASES
+/// Look up the display alias for an executable name, in the current language.
+pub fn alias_for(exe_name: &str) -> Option<String> {
+    let key = PROCESS_ALIASES
         .iter()
         .find(|(exe, _)| exe_name.eq_ignore_ascii_case(exe))
-        .map(|(_, alias)| *alias)
+        .map(|(_, key)| *key)?;
+
+    Some(crate::i18n::tr(key))
 }
 
 /// Executable name without the ".exe" suffix, e.g. "MapleStory".
@@ -88,7 +91,7 @@ impl WindowInfo {
     /// Short "1920×1080" style description
     pub fn dimensions(&self) -> String {
         if self.minimized {
-            "已最小化".to_string()
+            crate::i18n::tr("picker-minimized")
         } else {
             format!("{}\u{00D7}{}", self.width, self.height)
         }
@@ -182,10 +185,10 @@ impl WindowPickerState {
     }
 
     /// Label shown on the toolbar button – the alias once a window is picked
-    pub fn button_label(&self) -> &str {
+    pub fn button_label(&self) -> String {
         match &self.selected {
-            Some(info) => info.alias.as_str(),
-            None => "选择窗口",
+            Some(info) => info.alias.clone(),
+            None => crate::i18n::tr("picker-choose-window"),
         }
     }
 
@@ -250,7 +253,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     };
     let context = &mut *(lparam.0 as *mut EnumContext);
     let alias = match alias_for(&process) {
-        Some(alias) => alias.to_string(),
+        Some(alias) => alias,
         None => {
             if !context.include_others {
                 return CONTINUE;

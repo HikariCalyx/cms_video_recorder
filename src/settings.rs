@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use iced::keyboard::{key::Named, Key, Modifiers};
 
 use crate::config::{AppConfig, Hotkey};
+use crate::i18n::Language;
 
 /// What a captured key press means for the hotkey field.
 pub enum Capture {
@@ -37,6 +38,8 @@ pub struct SettingsState {
     /// True while the folder dialog is open, so the button can't be pressed
     /// twice.
     pub browsing: bool,
+    /// Display language selected in the panel.
+    pub language: Language,
 }
 
 impl SettingsState {
@@ -45,6 +48,7 @@ impl SettingsState {
         self.output_dir = config.output_dir.to_string_lossy().into_owned();
         self.max_duration = config.max_duration_secs.to_string();
         self.hotkey = config.hotkey;
+        self.language = config.language;
         self.capturing = false;
     }
 
@@ -63,6 +67,7 @@ impl SettingsState {
             },
             max_duration_secs: self.max_duration.trim().parse().unwrap_or(0),
             hotkey: self.hotkey,
+            language: self.language,
         }
     }
 

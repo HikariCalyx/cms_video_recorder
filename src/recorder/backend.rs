@@ -271,7 +271,7 @@ impl Recording {
         let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
 
         if !window.is_valid() {
-            return Err(Error::Capture("目标窗口已关闭".to_string()));
+            return Err(Error::Capture(crate::i18n::tr("error-target-closed")));
         }
 
         // Opened first: the encoder's audio stream has to be built for the
@@ -280,8 +280,16 @@ impl Recording {
         let audio = config
             .capture_audio
             .then(AudioCapture::start)
-            .and_then(Result::ok)
-            .map(Arc::new);
+            .and_then(|result| match result {
+                Ok(capture) => Some(Arc::new(capture)),
+                Err(error) => {
+                    // Never shown in the UI: recording falls back to silent
+                    // video, so debug builds log the reason to the console.
+                    #[cfg(debug_assertions)]
+                    eprintln!("[error] {error}");
+                    None
+                }
+            });
 
         let settings = Settings::new(
             window,
@@ -473,7 +481,7 @@ impl Session {
         let (width, height) = (layout.out_width, layout.out_height);
 
         if width == 0 || height == 0 {
-            return Err(Error::Capture("目标窗口尺寸无效".to_string()));
+            return Err(Error::Capture(crate::i18n::tr("error-target-size")));
         }
 
         VideoEncoder::new(

@@ -225,9 +225,7 @@ pub fn compress_to(
     session: &CompressionSession,
 ) -> CompressionReport {
     let Some(ffmpeg) = ffmpeg_path() else {
-        return CompressionReport::Failed(
-            "未找到 ffmpeg.exe（请确认它与程序放在一起）".to_string(),
-        );
+        return CompressionReport::Failed(crate::i18n::tr("error-ffmpeg-missing"));
     };
 
     // Nothing to gain from re-encoding; copy the clip straight across.
@@ -237,7 +235,11 @@ pub fn compress_to(
     if current < TARGET_BYTES {
         if source != destination {
             if let Err(error) = std::fs::copy(source, destination) {
-                return CompressionReport::Failed(format!("复制文件失败: {error}"));
+                return CompressionReport::Failed(crate::i18n::tr_arg(
+                    "error-copy-file",
+                    "error",
+                    error.to_string(),
+                ));
             }
         }
 
@@ -274,7 +276,11 @@ pub fn compress_to(
             Ok(meta) => meta.len(),
             Err(error) => {
                 let _ = std::fs::remove_file(&temp);
-                return CompressionReport::Failed(format!("读取压缩结果失败: {error}"));
+                return CompressionReport::Failed(crate::i18n::tr_arg(
+                    "error-read-result",
+                    "error",
+                    error.to_string(),
+                ));
             }
         };
 
@@ -308,7 +314,9 @@ fn finalize(
     size: u64,
     reached_target: bool,
 ) -> Result<CompressionOutcome, String> {
-    std::fs::rename(temp, path).map_err(|error| format!("替换原文件失败: {error}"))?;
+    std::fs::rename(temp, path).map_err(|error| {
+        crate::i18n::tr_arg("error-replace-file", "error", error.to_string())
+    })?;
     Ok(CompressionOutcome { size, reached_target })
 }
 
@@ -396,7 +404,13 @@ fn run_ffmpeg(
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return PassOutcome::Failed(format!("无法启动 ffmpeg: {error}")),
+        Err(error) => {
+            return PassOutcome::Failed(crate::i18n::tr_arg(
+                "error-ffmpeg-start",
+                "error",
+                error.to_string(),
+            ));
+        }
     };
 
     let stderr_reader = child.stderr.take().map(|pipe| {
@@ -412,7 +426,7 @@ fn run_ffmpeg(
     if let Ok(mut slot) = session.child.lock() {
         *slot = Some(child);
     } else {
-        return PassOutcome::Failed("压缩状态损坏".to_string());
+        return PassOutcome::Failed(crate::i18n::tr("error-compress-state"));
     }
 
     // Poll for completion, letting go of the lock between polls so a cancel
@@ -424,7 +438,7 @@ fn run_ffmpeg(
 
         let mut slot = match session.child.lock() {
             Ok(slot) => slot,
-            Err(_) => return PassOutcome::Failed("压缩状态损坏".to_string()),
+            Err(_) => return PassOutcome::Failed(crate::i18n::tr("error-compress-state")),
         };
 
         match slot.as_mut() {
@@ -434,7 +448,11 @@ fn run_ffmpeg(
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {}
                 Err(error) => {
-                    return PassOutcome::Failed(format!("等待 ffmpeg 结束失败: {error}"));
+                    return PassOutcome::Failed(crate::i18n::tr_arg(
+                        "error-ffmpeg-wait",
+                        "error",
+                        error.to_string(),
+                    ));
                 }
             },
         }
@@ -460,15 +478,20 @@ fn run_ffmpeg(
     match status {
         Some(status) if status.success() => PassOutcome::Done,
         _ => {
+            let error = ffmpeg_error(&stderr);
+
             // The toolbar status can only hold a one-line summary, so debug
             // builds also dump the full transcript to the console.
             #[cfg(debug_assertions)]
             {
-                eprintln!("--- ffmpeg 编码失败 (bitrate {bitrate_kbps}k) ---");
+                eprintln!(
+                    "--- {} ---",
+                    crate::i18n::tr_arg("error-ffmpeg-encode", "error", &error)
+                );
                 eprintln!("{}", String::from_utf8_lossy(&stderr));
             }
 
-            PassOutcome::Failed(format!("ffmpeg 编码失败: {}", ffmpeg_error(&stderr)))
+            PassOutcome::Failed(crate::i18n::tr_arg("error-ffmpeg-encode", "error", error))
         }
     }
 }
@@ -502,11 +525,12 @@ fn ffmpeg_args(input: &Path, output: &Path, bitrate_kbps: i64) -> Vec<String> {
 /// Last non-empty line of ffmpeg's stderr, clipped to a readable length.
 fn ffmpeg_error(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
+    let fallback = crate::i18n::tr("word-unknown-error");
     let tail = text
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or("未知错误");
+        .unwrap_or(&fallback);
 
     tail.chars().take(120).collect()
 }
@@ -562,16 +586,20 @@ fn shell_open(path: &Path, parameters: Option<&str>) -> Result<(), String> {
     if code.0 as isize > 32 {
         Ok(())
     } else {
-        Err(format!("ShellExecute 返回 {}", code.0 as isize))
+        Err(crate::i18n::tr_arg(
+            "error-shellexecute",
+            "code",
+            (code.0 as isize).to_string(),
+        ))
     }
 }
 
 #[cfg(not(windows))]
 pub fn play(_path: &Path) -> Result<(), String> {
-    Err("当前平台不支持".to_string())
+    Err(crate::i18n::tr("error-unsupported-platform"))
 }
 
 #[cfg(not(windows))]
 pub fn browse(_path: &Path) -> Result<(), String> {
-    Err("当前平台不支持".to_string())
+    Err(crate::i18n::tr("error-unsupported-platform"))
 }

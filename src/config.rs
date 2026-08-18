@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::Language;
 use crate::recorder::{self, RecorderConfig};
 
 /// Folder created under `%APPDATA%` for the config file.
@@ -175,6 +176,8 @@ pub struct AppConfig {
     pub max_duration_secs: u64,
     /// System-wide record/stop shortcut, or `None` to disable it.
     pub hotkey: Option<Hotkey>,
+    /// Display language.
+    pub language: Language,
 }
 
 impl Default for AppConfig {
@@ -183,6 +186,7 @@ impl Default for AppConfig {
             output_dir: recorder::default_output_dir(),
             max_duration_secs: recorder::MAX_DURATION.as_secs(),
             hotkey: Some(Hotkey::DEFAULT),
+            language: Language::default(),
         }
     }
 }
@@ -213,7 +217,7 @@ impl AppConfig {
     /// Writes the config file, creating `%APPDATA%\cms_video_recorder` if it
     /// isn't there yet.
     pub fn save(&self) -> Result<(), String> {
-        let path = config_path().ok_or_else(|| "无法定位 APPDATA".to_string())?;
+        let path = config_path().ok_or_else(|| crate::i18n::tr("error-no-appdata"))?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;

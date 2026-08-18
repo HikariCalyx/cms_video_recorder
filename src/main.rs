@@ -10,6 +10,7 @@ mod film;
 mod hotkey;
 #[cfg(windows)]
 mod icon;
+mod i18n;
 mod recorder;
 mod settings;
 mod toolbar;

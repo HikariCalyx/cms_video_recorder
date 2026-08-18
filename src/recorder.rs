@@ -129,12 +129,14 @@ pub enum Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(msg) => write!(f, "文件写入失败: {msg}"),
-            Self::Encoder(msg) => write!(f, "编码失败: {msg}"),
-            Self::Capture(msg) => write!(f, "录制失败: {msg}"),
-            Self::Audio(msg) => write!(f, "音频录制失败: {msg}"),
-        }
+        let message = match self {
+            Self::Io(msg) => crate::i18n::tr_arg("error-io", "msg", msg),
+            Self::Encoder(msg) => crate::i18n::tr_arg("error-encoder", "msg", msg),
+            Self::Capture(msg) => crate::i18n::tr_arg("error-capture", "msg", msg),
+            Self::Audio(msg) => crate::i18n::tr_arg("error-audio", "msg", msg),
+        };
+
+        f.write_str(&message)
     }
 }
 
@@ -227,7 +229,7 @@ pub struct Recording;
 #[cfg(not(windows))]
 impl Recording {
     pub fn start(_hwnd: isize, _alias: &str, _config: &RecorderConfig) -> Result<Self, Error> {
-        Err(Error::Capture("当前平台不支持录制".to_string()))
+        Err(Error::Capture(crate::i18n::tr("error-unsupported-recording")))
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -243,6 +245,6 @@ impl Recording {
     }
 
     pub fn finish(self) -> Result<PathBuf, Error> {
-        Err(Error::Capture("当前平台不支持录制".to_string()))
+        Err(Error::Capture(crate::i18n::tr("error-unsupported-recording")))
     }
 }

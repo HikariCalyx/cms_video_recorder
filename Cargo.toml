@@ -9,6 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 dirs = "6.0.0"
+# Fluent localization: user-visible strings live in i18n/*.ftl
+# (Simplified Chinese, Traditional Chinese and English).
+fluent = "0.16"
 # The "tokio" feature selects a real async backend. Without it,
 # `iced::time::every` resolves to a no-op stream and the recording
 # countdown would never tick.
@@ -24,6 +27,8 @@ serde_json = "1.0.145"
 windows-capture = "2.0.1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    # GetUserDefaultLocaleName, to pick the first-run language
+    "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     # WASAPI loopback capture, for recording what's playing

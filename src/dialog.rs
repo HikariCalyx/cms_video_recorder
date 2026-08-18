@@ -59,7 +59,7 @@ unsafe fn show(current: &Path) -> Option<PathBuf> {
     dialog
         .SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)
         .ok()?;
-    let _ = dialog.SetTitle(&HSTRING::from("选择保存位置"));
+    let _ = dialog.SetTitle(&HSTRING::from(crate::i18n::tr("dialog-pick-folder")));
 
     // Opening on the current directory only works once it exists; before the
     // first recording it usually doesn't, and the shell picks its own default.
@@ -113,7 +113,7 @@ pub fn pick_save_file(_directory: &Path, _suggested_name: &str) -> Option<PathBu
 unsafe fn show_save(directory: &Path, suggested_name: &str) -> Option<PathBuf> {
     let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL).ok()?;
 
-    let _ = dialog.SetTitle(&HSTRING::from("保存压缩视频"));
+    let _ = dialog.SetTitle(&HSTRING::from(crate::i18n::tr("dialog-save-compressed")));
 
     // `SetDefaultExtension` only kicks in when the user types a name without
     // an extension, so a bare name always lands as an MP4.

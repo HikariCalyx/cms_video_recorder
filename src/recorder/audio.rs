@@ -118,7 +118,7 @@ impl AudioCapture {
             }
             Err(_) => {
                 let _ = thread.join();
-                Err(Error::Audio("音频线程意外结束".to_string()))
+                Err(Error::Audio(crate::i18n::tr("error-audio-thread")))
             }
         }
     }
@@ -169,7 +169,7 @@ fn capture_thread(shared: &Shared, sender: &std::sync::mpsc::Sender<Result<Audio
     // MTA, because nothing here needs a message pump.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if com.is_err() {
-        let _ = sender.send(Err(Error::Audio("COM 初始化失败".to_string())));
+        let _ = sender.send(Err(Error::Audio(crate::i18n::tr("error-com-init"))));
         return;
     }
 
@@ -178,7 +178,10 @@ fn capture_thread(shared: &Shared, sender: &std::sync::mpsc::Sender<Result<Audio
     if let Err(error) = result {
         // If setup already reported a format, the consumer has moved on and
         // there is nobody left to tell; losing audio mid-recording just means
-        // the tail is padded with silence.
+        // the tail is padded with silence. Debug builds log the full error
+        // instead, since it never reaches the UI.
+        #[cfg(debug_assertions)]
+        eprintln!("[error] {error}");
         let _ = sender.send(Err(error));
     }
 
@@ -192,21 +195,21 @@ fn run_capture(
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|error| audio_error("枚举音频设备失败", error))?;
+                .map_err(|error| audio_error(&crate::i18n::tr("error-enum-devices"), error))?;
 
         // eRender + LOOPBACK is what turns a playback endpoint into a capture
         // source; eCapture would pick up the microphone instead.
         let device = enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
-            .map_err(|error| audio_error("未找到默认播放设备", error))?;
+            .map_err(|error| audio_error(&crate::i18n::tr("error-default-device"), error))?;
 
         let client: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
-            .map_err(|error| audio_error("激活音频客户端失败", error))?;
+            .map_err(|error| audio_error(&crate::i18n::tr("error-activate-client"), error))?;
 
         let mix_format = client
             .GetMixFormat()
-            .map_err(|error| audio_error("读取音频格式失败", error))?;
+            .map_err(|error| audio_error(&crate::i18n::tr("error-mix-format"), error))?;
         let source = SourceFormat::from_wave_format(mix_format)?;
 
         // A 200ms endpoint buffer leaves plenty of slack for the poll interval.
@@ -219,11 +222,11 @@ fn run_capture(
                 mix_format,
                 None,
             )
-            .map_err(|error| audio_error("初始化音频采集失败", error))?;
+            .map_err(|error| audio_error(&crate::i18n::tr("error-init-capture"), error))?;
 
         let capture: IAudioCaptureClient = client
             .GetService()
-            .map_err(|error| audio_error("获取音频采集接口失败", error))?;
+            .map_err(|error| audio_error(&crate::i18n::tr("error-capture-interface"), error))?;
 
         let format = AudioFormat {
             sample_rate: source.sample_rate,
@@ -233,7 +236,7 @@ fn run_capture(
 
         client
             .Start()
-            .map_err(|error| audio_error("启动音频采集失败", error))?;
+            .map_err(|error| audio_error(&crate::i18n::tr("error-start-capture"), error))?;
 
         // Setup succeeded; the encoder can now be built against this format.
         let _ = sender.send(Ok(format));
@@ -305,7 +308,7 @@ unsafe fn drain_endpoint(
     loop {
         let packet = capture
             .GetNextPacketSize()
-            .map_err(|error| Error::Audio(format!("读取音频包失败: {error}")))?;
+            .map_err(|error| Error::Audio(crate::i18n::tr_arg("error-read-packet", "error", error.to_string())))?;
         if packet == 0 {
             return Ok(());
         }
@@ -316,7 +319,7 @@ unsafe fn drain_endpoint(
 
         capture
             .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
-            .map_err(|error| Error::Audio(format!("获取音频缓冲失败: {error}")))?;
+            .map_err(|error| Error::Audio(crate::i18n::tr_arg("error-get-buffer", "error", error.to_string())))?;
 
         if keep && frames > 0 {
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
@@ -333,7 +336,7 @@ unsafe fn drain_endpoint(
 
         capture
             .ReleaseBuffer(frames)
-            .map_err(|error| Error::Audio(format!("释放音频缓冲失败: {error}")))?;
+            .map_err(|error| Error::Audio(crate::i18n::tr_arg("error-release-buffer", "error", error.to_string())))?;
     }
 }
 
@@ -375,12 +378,16 @@ impl SourceFormat {
 
         let bytes = (wave.wBitsPerSample / 8) as usize;
         if bytes == 0 || wave.nChannels == 0 {
-            return Err(Error::Audio("音频格式无效".to_string()));
+            return Err(Error::Audio(crate::i18n::tr("error-audio-format")));
         }
 
         let kind = if is_float {
             if bytes != 4 {
-                return Err(Error::Audio(format!("不支持的浮点位深: {bytes}")));
+                return Err(Error::Audio(crate::i18n::tr_arg(
+                    "error-float-bit-depth",
+                    "bytes",
+                    bytes.to_string(),
+                )));
             }
             SampleKind::F32
         } else {
