@@ -99,6 +99,12 @@ impl Default for Language {
     }
 }
 
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// The OS's UI locale name, e.g. "zh-CN" or "en-US".
 #[cfg(windows)]
 fn os_locale() -> Option<String> {

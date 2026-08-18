@@ -9,8 +9,8 @@ use iced::{
     futures::channel::oneshot,
     keyboard,
     widget::{
-        button, checkbox, column, container, horizontal_space, image, mouse_area, row, scrollable,
-        text, text_input,
+        button, checkbox, column, container, horizontal_space, image, mouse_area, pick_list, row,
+        scrollable, text, text_input,
     },
     window, Alignment, Background, Border, Color, Element, Font, Length, Shadow, Size, Subscription,
     Task, Theme,
@@ -1306,14 +1306,14 @@ impl Toolbar {
         .color(Color::from_rgb8(0x7E, 0x7E, 0x8A))
         .wrapping(text::Wrapping::None);
 
-        let mut language_row = row![].spacing(6).align_y(Alignment::Center);
-        for language in Language::ALL {
-            language_row = language_row.push(language_button(
-                language.label().to_string(),
-                self.settings.language == language,
-                Message::SelectLanguage(language),
-            ));
-        }
+        let language_row = pick_list(
+            Language::ALL,
+            Some(self.settings.language),
+            Message::SelectLanguage,
+        )
+        .text_size(11)
+        .padding([5, 8])
+        .width(Length::Fill);
 
         let panel = column![
             header,
@@ -1572,19 +1572,6 @@ fn small_button_maybe(label: String, msg: Option<Message>) -> Element<'static, M
     button(text(label).size(11))
         .style(subtle_button_style)
         .on_press_maybe(msg)
-        .padding([4, 9])
-        .into()
-}
-
-/// One choice in the settings panel's language row.
-fn language_button<'a>(label: String, active: bool, msg: Message) -> Element<'a, Message> {
-    button(text(label).size(11))
-        .style(if active {
-            language_active_style
-        } else {
-            subtle_button_style
-        })
-        .on_press(msg)
         .padding([4, 9])
         .into()
 }
@@ -1961,16 +1948,6 @@ fn list_item_style(_theme: &Theme, status: button::Status) -> button::Style {
 }
 
 fn list_item_selected_style(_theme: &Theme, status: button::Status) -> button::Style {
-    let bg = if is_active(status) {
-        Color::from_rgb8(0x3D, 0x74, 0xE8)
-    } else {
-        Color::from_rgb8(0x2F, 0x62, 0xD4)
-    };
-    rounded(5.0, bg, Color::WHITE)
-}
-
-/// Highlighted while it is the currently selected language.
-fn language_active_style(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = if is_active(status) {
         Color::from_rgb8(0x3D, 0x74, 0xE8)
     } else {

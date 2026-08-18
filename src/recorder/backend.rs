@@ -300,11 +300,13 @@ impl Recording {
             .then(AudioCapture::start)
             .and_then(|result| match result {
                 Ok(capture) => Some(Arc::new(capture)),
-                Err(error) => {
+                // `_error` only exists for the debug-only console line below;
+                // in release builds the binding is intentionally unused.
+                Err(_error) => {
                     // Never shown in the UI: recording falls back to silent
                     // video, so debug builds log the reason to the console.
                     #[cfg(debug_assertions)]
-                    eprintln!("[error] {error}");
+                    eprintln!("[error] {_error}");
                     None
                 }
             });
