@@ -1,7 +1,7 @@
 // toolbar.rs – main floating toolbar state and view
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use iced::{
@@ -21,6 +21,7 @@ use crate::recorder::{self, Recording};
 use crate::settings::{self, Capture, SettingsState};
 use crate::videos::VideosState;
 use crate::window_picker::{WindowInfo, WindowPickerState};
+use iced::widget::scrollable::{Direction, Scrollbar};
 
 /// Default UI font – Microsoft YaHei UI ships with Windows and covers both
 /// Latin and CJK, so labels and window titles render without tofu boxes.
@@ -122,12 +123,22 @@ pub enum Message {
     RefreshVideos,
     /// Open a clip in the default player
     PlayVideo(PathBuf),
-    /// Compress a clip – placeholder until compression ships
+    /// Compress a clip with the bundled ffmpeg
     CompressVideo(PathBuf),
+    /// The save dialog closed; `Some` is where the compressed file should go
+    CompressTargetPicked(Option<PathBuf>),
+    /// The ffmpeg pass finished (or failed, or was cancelled)
+    CompressionFinished(crate::videos::CompressionReport),
+    /// Cancel the running compression
+    CancelCompression,
     /// Reveal a clip in an Explorer window
     BrowseVideo(PathBuf),
     /// Delete a clip from disk
     DeleteVideo(PathBuf),
+    /// The user confirmed the pending deletion
+    ConfirmDeleteVideo,
+    /// The user backed out of the pending deletion
+    CancelDeleteVideo,
     /// The output directory field was edited
     OutputDirChanged(String),
     /// The duration-cap field was edited
@@ -161,6 +172,8 @@ enum Status {
     Saved(PathBuf),
     /// A clip was deleted from disk.
     Deleted(String),
+    /// A clip was compressed in place.
+    Compressed(String),
     /// A neutral message, e.g. from a placeholder action.
     Info(String),
     Failed(String),
@@ -446,6 +459,7 @@ impl Toolbar {
                 // Only one panel fits in the window at a time.
                 if self.picker.is_open {
                     self.videos.is_open = false;
+                    self.videos.pending_delete = None;
                 }
                 let settings = if self.picker.is_open {
                     self.close_settings()
@@ -566,12 +580,14 @@ impl Toolbar {
                     self.picker.is_open = false;
                 }
                 self.videos.is_open = false;
+                self.videos.pending_delete = None;
 
                 return self.sync_window_size();
             }
             Message::ToggleVideos => {
                 if self.videos.is_open {
                     self.videos.is_open = false;
+                    self.videos.pending_delete = None;
                     return self.sync_window_size();
                 }
 
@@ -599,11 +615,141 @@ impl Toolbar {
                 }
             }
             Message::CompressVideo(path) => {
-                // Placeholder until the transcoder lands.
-                self.set_status(Status::Info(format!(
-                    "压缩功能开发中: {}",
-                    file_name(&path)
-                )));
+                // The encoder is already busy capturing; don't stack a
+                // software encode on top of a live recording.
+                if self.is_recording() {
+                    self.set_status(Status::Info("请先停止录制再压缩".to_string()));
+                    return Task::none();
+                }
+
+                // One pass at a time.
+                if self.videos.compressing.is_some() {
+                    self.set_status(Status::Info("已有视频正在压缩".to_string()));
+                    return Task::none();
+                }
+
+                // Fail before asking for a location: if ffmpeg was deleted,
+                // the user should know there's nothing to compress with.
+                if crate::videos::ffmpeg_path().is_none() {
+                    self.set_status(Status::Failed(
+                        "未找到 ffmpeg.exe，请放回程序目录".to_string(),
+                    ));
+                    return Task::none();
+                }
+
+                self.videos.compressing = Some(path.clone());
+                self.videos.session = Some(crate::videos::CompressionSession::default());
+
+                // Ask where the compressed file should go. The dialog opens
+                // on the clip's folder, with the name pre-filled.
+                let directory = path
+                    .parent()
+                    .map(|parent| parent.to_path_buf())
+                    .unwrap_or_default();
+                let suggested = format!(
+                    "{}_compressed",
+                    crate::videos::display_name(&file_name(&path))
+                );
+
+                let (sender, receiver) = oneshot::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(crate::dialog::pick_save_file(&directory, &suggested));
+                });
+
+                return Task::perform(
+                    async move { receiver.await.unwrap_or(None) },
+                    Message::CompressTargetPicked,
+                );
+            }
+            Message::CompressTargetPicked(destination) => {
+                let Some(source) = self.videos.compressing.take() else {
+                    return Task::none();
+                };
+
+                // Cancelled at the dialog: drop the busy marker. If the
+                // user pressed 取消 while it was up, say so.
+                let Some(destination) = destination else {
+                    let was_cancelled = self
+                        .videos
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.is_cancelled());
+                    self.videos.session = None;
+
+                    if was_cancelled {
+                        self.set_status(Status::Info("已取消压缩".to_string()));
+                    }
+                    return Task::none();
+                };
+
+                let Some(session) = self.videos.session.clone() else {
+                    return Task::none();
+                };
+
+                // The save dialog has no owner window, so the toolbar stays
+                // clickable while it is up – a cancel pressed then counts.
+                if session.is_cancelled() {
+                    self.videos.compressing = None;
+                    self.videos.session = None;
+                    self.set_status(Status::Info("已取消压缩".to_string()));
+                    return Task::none();
+                }
+
+                // Keep the busy marker through the encode itself.
+                self.videos.compressing = Some(source.clone());
+
+                let (sender, receiver) = oneshot::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(crate::videos::compress_to(
+                        &source,
+                        &destination,
+                        &session,
+                    ));
+                });
+
+                return Task::perform(
+                    async move {
+                        receiver.await.unwrap_or_else(|_| {
+                            crate::videos::CompressionReport::Failed(
+                                "压缩线程意外结束".to_string(),
+                            )
+                        })
+                    },
+                    Message::CompressionFinished,
+                );
+            }
+            Message::CompressionFinished(report) => {
+                self.videos.compressing = None;
+                self.videos.session = None;
+
+                match report {
+                    crate::videos::CompressionReport::Done(outcome) => {
+                        let size = crate::videos::human_size(outcome.size);
+                        let message = if outcome.reached_target {
+                            format!("已压缩到 {size}")
+                        } else {
+                            format!("已压缩到 {size}（未达 5000KB）")
+                        };
+                        self.set_status(Status::Compressed(message));
+                    }
+                    crate::videos::CompressionReport::Failed(error) => {
+                        self.set_status(Status::Failed(format!("压缩失败: {error}")));
+                    }
+                    crate::videos::CompressionReport::Cancelled => {
+                        self.set_status(Status::Info("已取消压缩".to_string()));
+                    }
+                }
+
+                if self.videos.is_open {
+                    self.videos.refresh(&self.config.output_dir);
+                }
+            }
+            Message::CancelCompression => {
+                // The worker (or the pending dialog result) notices the flag
+                // and reports back; stay busy until it does.
+                if let Some(session) = &self.videos.session {
+                    session.cancel();
+                }
             }
             Message::BrowseVideo(path) => {
                 if let Err(error) = crate::videos::browse(&path) {
@@ -611,7 +757,16 @@ impl Toolbar {
                 }
             }
             Message::DeleteVideo(path) => {
-                let name = file_name(&path);
+                // Arm the confirmation: the row asks again before anything
+                // is removed from disk.
+                self.videos.pending_delete = Some(path);
+            }
+            Message::ConfirmDeleteVideo => {
+                let Some(path) = self.videos.pending_delete.take() else {
+                    return Task::none();
+                };
+
+                let name = crate::videos::display_name(&file_name(&path)).to_string();
 
                 match crate::videos::delete(&path) {
                     Ok(()) => {
@@ -625,6 +780,9 @@ impl Toolbar {
                         self.set_status(Status::Failed(format!("删除失败: {error}")));
                     }
                 }
+            }
+            Message::CancelDeleteVideo => {
+                self.videos.pending_delete = None;
             }
             Message::OutputDirChanged(value) => {
                 self.settings.output_dir = value;
@@ -930,6 +1088,7 @@ impl Toolbar {
                 format!("已删除 {name}"),
                 Color::from_rgb8(0x7E, 0xC8, 0x8A),
             ),
+            Status::Compressed(message) => (message.clone(), Color::from_rgb8(0x7E, 0xC8, 0x8A)),
             Status::Info(message) => (message.clone(), Color::from_rgb8(0x9C, 0xB8, 0xF0)),
             Status::Failed(reason) => (reason.clone(), Color::from_rgb8(0xE8, 0x7A, 0x7A)),
         };
@@ -1025,7 +1184,7 @@ impl Toolbar {
                 );
             }
 
-            scrollable(items).height(Length::Fill).into()
+            list_scrollable(items)
         };
 
         let mut panel = column![header, filter_row, list].spacing(8).padding([8, 12]);
@@ -1168,30 +1327,88 @@ impl Toolbar {
             let mut items = column![].spacing(2);
 
             for entry in &self.videos.videos {
-                let actions = row![
-                    small_button("播放", Message::PlayVideo(entry.path.clone())),
-                    small_button("压缩", Message::CompressVideo(entry.path.clone())),
-                    small_button("浏览", Message::BrowseVideo(entry.path.clone())),
-                    small_danger_button("删除", Message::DeleteVideo(entry.path.clone())),
-                ]
-                .spacing(4)
-                .align_y(Alignment::Center);
+                let compressing = self
+                    .videos
+                    .compressing
+                    .as_ref()
+                    .is_some_and(|current| current == &entry.path);
+
+                let confirming = self
+                    .videos
+                    .pending_delete
+                    .as_ref()
+                    .is_some_and(|pending| pending == &entry.path);
+
+                let actions = if compressing {
+                    // The ffmpeg pass runs on a worker; other actions are
+                    // hidden while the file is being rewritten, and the pass
+                    // can be cancelled.
+                    row![
+                        text("压缩中…")
+                            .size(11)
+                            .color(Color::from_rgb8(0x9C, 0xB8, 0xF0)),
+                        small_button("取消", Message::CancelCompression),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                } else if confirming {
+                    // Inline confirmation in place of a modal: the row's
+                    // actions are swapped until 确认 or 取消 is pressed.
+                    row![
+                        text("确认删除?")
+                            .size(11)
+                            .color(Color::from_rgb8(0xE8, 0x7A, 0x7A)),
+                        small_danger_button("删除", Message::ConfirmDeleteVideo),
+                        small_button("取消", Message::CancelDeleteVideo),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                } else {
+                    // While a compression is running, the other rows'
+                    // compress buttons dim out instead of queueing.
+                    row![
+                        small_button("播放", Message::PlayVideo(entry.path.clone())),
+                        small_button_maybe(
+                            "压缩",
+                            self.videos
+                                .compressing
+                                .is_none()
+                                .then_some(Message::CompressVideo(entry.path.clone())),
+                        ),
+                        small_button("浏览", Message::BrowseVideo(entry.path.clone())),
+                        small_danger_button("删除", Message::DeleteVideo(entry.path.clone())),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                };
+
+                // The name takes whatever room the row leaves over, clipping
+                // rather than shoving the actions around.
+                let name = container(
+                    text(entry.display_name())
+                        .size(12)
+                        .wrapping(text::Wrapping::None),
+                )
+                .width(Length::Fill)
+                .clip(true)
+                .align_y(iced::alignment::Vertical::Center);
+
+                let size = text(crate::videos::human_size(entry.size))
+                    .size(11)
+                    .color(Color::from_rgb8(0x7E, 0x7E, 0x8A))
+                    .width(Length::Fixed(64.0))
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .align_y(iced::alignment::Vertical::Center);
 
                 items = items.push(
-                    row![
-                        text(truncate(&entry.name, 24))
-                            .size(12)
-                            .width(Length::Fill)
-                            .wrapping(text::Wrapping::None),
-                        actions,
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center)
-                    .padding([6, 2]),
+                    row![name, size, actions]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .padding([6, 2]),
                 );
             }
 
-            scrollable(items).height(Length::Fill).into()
+            list_scrollable(items)
         };
 
         let panel = column![header, list].spacing(8).padding([8, 12]);
@@ -1244,7 +1461,20 @@ impl Toolbar {
     // Theme
     // -----------------------------------------------------------------------
     pub fn theme(&self) -> Theme {
-        Theme::Dark
+        // Dark, with one accent swapped: the scrollbar's hover stress colour.
+        static THEME: OnceLock<Theme> = OnceLock::new();
+
+        THEME
+            .get_or_init(|| {
+                let palette = Theme::Dark.palette();
+
+                Theme::custom_with_fn("CMS Video Recorder".to_string(), palette, |palette| {
+                    let mut extended = iced::theme::palette::Extended::generate(palette);
+                    extended.primary.strong.color = Color::from_rgb8(0xFF, 0x9D, 0x00);
+                    extended
+                })
+            })
+            .clone()
     }
 }
 
@@ -1285,6 +1515,25 @@ fn small_danger_button(label: &str, msg: Message) -> Element<'_, Message> {
         .style(danger_button_style)
         .on_press(msg)
         .padding([4, 9])
+        .into()
+}
+
+/// A small button that may be disabled by passing `None`.
+fn small_button_maybe(label: &str, msg: Option<Message>) -> Element<'_, Message> {
+    button(text(label).size(11))
+        .style(subtle_button_style)
+        .on_press_maybe(msg)
+        .padding([4, 9])
+        .into()
+}
+
+/// A scrollable list with the slim scrollbar used by both panels.
+fn list_scrollable<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    scrollable(content)
+        .direction(Direction::Vertical(
+            Scrollbar::default().width(4.0).scroller_width(4.0),
+        ))
+        .height(Length::Fill)
         .into()
 }
 
@@ -1612,6 +1861,16 @@ fn field_style(_theme: &Theme, status: text_input::Status) -> text_input::Style 
 }
 
 fn subtle_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    // Dimmed while disabled, e.g. the compress button while another clip is
+    // being compressed.
+    if is_disabled(status) {
+        return rounded(
+            5.0,
+            Color::from_rgb8(0x24, 0x24, 0x2B),
+            Color::from_rgb8(0x5E, 0x5E, 0x68),
+        );
+    }
+
     let bg = if is_active(status) {
         Color::from_rgb8(0x3C, 0x3C, 0x46)
     } else {

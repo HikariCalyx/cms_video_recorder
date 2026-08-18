@@ -1,10 +1,12 @@
 // videos.rs – the recordings manager
 //
 // Lists the MP4 files in the configured output directory and offers per-clip
-// actions: play in the default player, compress (placeholder), reveal in
-// Explorer, and delete.
+// actions: play in the default player, compress with the bundled ffmpeg,
+// reveal in Explorer, and delete.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,10 @@ pub struct VideosState {
     pub videos: Vec<VideoEntry>,
     /// Clip waiting for its deletion to be confirmed.
     pub pending_delete: Option<PathBuf>,
+    /// Clip being compressed on the worker thread.
+    pub compressing: Option<PathBuf>,
+    /// Cancellation handle for the running pass, if any.
+    pub session: Option<CompressionSession>,
 }
 
 impl VideosState {
@@ -133,6 +139,376 @@ pub fn human_size(bytes: u64) -> String {
 /// Permanently deletes a clip.
 pub fn delete(path: &Path) -> Result<(), String> {
     std::fs::remove_file(path).map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Compression
+// ---------------------------------------------------------------------------
+
+/// Compressed size the pass walks down to, in bytes: 5000 KB.
+const TARGET_BYTES: u64 = 5000 * 1024;
+/// Starting video bitrate, in kbps: 5 Mbps.
+const START_BITRATE: i64 = 5000;
+/// How much each retry drops the bitrate.
+const BITRATE_STEP: i64 = 200;
+/// Floor below which the video isn't worth keeping.
+const MIN_BITRATE: i64 = 200;
+
+/// ffmpeg is a console app; without this a console window would flash for
+/// every pass.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// What a compression pass produced.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressionOutcome {
+    /// Size of the compressed file, in bytes.
+    pub size: u64,
+    /// True when the 5000 KB target was reached.
+    pub reached_target: bool,
+}
+
+/// What the worker reports back once it is done, however it ended.
+#[derive(Debug, Clone)]
+pub enum CompressionReport {
+    /// The destination file is ready.
+    Done(CompressionOutcome),
+    /// ffmpeg failed; the destination is untouched.
+    Failed(String),
+    /// The user pressed cancel; the partial file was removed.
+    Cancelled,
+}
+
+/// Shared handle between the UI thread and the encode worker.
+///
+/// The UI keeps one to cancel; the worker registers the live ffmpeg process
+/// in it so `cancel` can kill it mid-pass.
+#[derive(Debug, Default, Clone)]
+pub struct CompressionSession {
+    child: Arc<Mutex<Option<std::process::Child>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CompressionSession {
+    /// Requests cancellation and kills the running ffmpeg process, if any.
+    ///
+    /// The worker notices the flag at its next poll, tidies the temp file and
+    /// reports back [`CompressionReport::Cancelled`].
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+
+        if let Ok(mut slot) = self.child.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+                // Dropping the handle closes the process handle; `kill` has
+                // already fired, so the UI thread never blocks on `wait`.
+            }
+        }
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Re-encodes `source` into `destination` with ffmpeg, walking the bitrate
+/// down from 5 Mbps in 200 kbps steps until the file shrinks under 5000 KB.
+///
+/// The source is only ever read, never modified: ffmpeg writes a temporary
+/// file next to the destination and it is renamed over on success. Runs to
+/// completion before returning, so it belongs on a worker thread. The shared
+/// `session` lets the UI cancel mid-pass.
+pub fn compress_to(
+    source: &Path,
+    destination: &Path,
+    session: &CompressionSession,
+) -> CompressionReport {
+    let Some(ffmpeg) = ffmpeg_path() else {
+        return CompressionReport::Failed(
+            "未找到 ffmpeg.exe（请确认它与程序放在一起）".to_string(),
+        );
+    };
+
+    // Nothing to gain from re-encoding; copy the clip straight across.
+    let current = std::fs::metadata(source)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    if current < TARGET_BYTES {
+        if source != destination {
+            if let Err(error) = std::fs::copy(source, destination) {
+                return CompressionReport::Failed(format!("复制文件失败: {error}"));
+            }
+        }
+
+        return CompressionReport::Done(CompressionOutcome {
+            size: current,
+            reached_target: true,
+        });
+    }
+
+    let temp = temp_path(destination);
+    let _ = std::fs::remove_file(&temp);
+
+    let mut bitrate = START_BITRATE;
+
+    loop {
+        if session.is_cancelled() {
+            let _ = std::fs::remove_file(&temp);
+            return CompressionReport::Cancelled;
+        }
+
+        match run_ffmpeg(&ffmpeg, source, &temp, bitrate, session) {
+            PassOutcome::Done => {}
+            PassOutcome::Failed(error) => {
+                let _ = std::fs::remove_file(&temp);
+                return CompressionReport::Failed(error);
+            }
+            PassOutcome::Cancelled => {
+                let _ = std::fs::remove_file(&temp);
+                return CompressionReport::Cancelled;
+            }
+        }
+
+        let size = match std::fs::metadata(&temp) {
+            Ok(meta) => meta.len(),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                return CompressionReport::Failed(format!("读取压缩结果失败: {error}"));
+            }
+        };
+
+        if size < TARGET_BYTES {
+            return match finalize(destination, &temp, size, true) {
+                Ok(outcome) => CompressionReport::Done(outcome),
+                Err(error) => CompressionReport::Failed(error),
+            };
+        }
+
+        bitrate -= BITRATE_STEP;
+        if bitrate < MIN_BITRATE {
+            // The floor was reached without meeting the target. Keep the
+            // smallest result instead of throwing the work away.
+            return match finalize(destination, &temp, size, false) {
+                Ok(outcome) => CompressionReport::Done(outcome),
+                Err(error) => CompressionReport::Failed(error),
+            };
+        }
+    }
+}
+
+/// Replaces the original with the compressed file.
+///
+/// Both live in the same directory, and `fs::rename` maps to
+/// `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` on Windows, so the original
+/// is swapped out in one step.
+fn finalize(
+    path: &Path,
+    temp: &Path,
+    size: u64,
+    reached_target: bool,
+) -> Result<CompressionOutcome, String> {
+    std::fs::rename(temp, path).map_err(|error| format!("替换原文件失败: {error}"))?;
+    Ok(CompressionOutcome { size, reached_target })
+}
+
+/// The temporary file ffmpeg writes into: `clip.mp4.compress`, same folder.
+fn temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "clip.mp4".to_string());
+
+    path.with_file_name(format!("{name}.compress"))
+}
+
+#[cfg(windows)]
+const FFMPEG_NAME: &str = "ffmpeg.exe";
+#[cfg(not(windows))]
+const FFMPEG_NAME: &str = "ffmpeg";
+
+/// Locates the bundled ffmpeg: next to the executable, in an `ffmpeg`
+/// subfolder next to it, or anywhere on `PATH` as a development fallback.
+///
+/// `None` means the file is missing – the caller shows the user where to put
+/// it back.
+pub fn ffmpeg_path() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf);
+
+    if let Some(dir) = exe_dir {
+        let direct = dir.join(FFMPEG_NAME);
+        if direct.is_file() {
+            return Some(direct);
+        }
+
+        let nested = dir.join("ffmpeg").join(FFMPEG_NAME);
+        if nested.is_file() {
+            return Some(nested);
+        }
+    }
+
+    for entry in std::env::split_paths(&std::env::var_os("PATH")?) {
+        let candidate = entry.join(FFMPEG_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Outcome of one ffmpeg pass.
+enum PassOutcome {
+    Done,
+    Failed(String),
+    Cancelled,
+}
+
+/// One ffmpeg pass.
+///
+/// The process is registered in `session` so the UI thread can kill it, and
+/// stderr is drained on a side thread so the pipe can never fill up and stall
+/// ffmpeg.
+fn run_ffmpeg(
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    bitrate_kbps: i64,
+    session: &CompressionSession,
+) -> PassOutcome {
+    use std::io::Read;
+
+    let mut command = std::process::Command::new(ffmpeg);
+    command
+        .args(ffmpeg_args(input, output, bitrate_kbps))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return PassOutcome::Failed(format!("无法启动 ffmpeg: {error}")),
+    };
+
+    let stderr_reader = child.stderr.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let mut reader = std::io::BufReader::new(pipe);
+            let _ = reader.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+
+    // Publish the live handle so the UI thread can cancel.
+    if let Ok(mut slot) = session.child.lock() {
+        *slot = Some(child);
+    } else {
+        return PassOutcome::Failed("压缩状态损坏".to_string());
+    }
+
+    // Poll for completion, letting go of the lock between polls so a cancel
+    // can reach the child.
+    let status = loop {
+        if session.is_cancelled() {
+            break None;
+        }
+
+        let mut slot = match session.child.lock() {
+            Ok(slot) => slot,
+            Err(_) => return PassOutcome::Failed("压缩状态损坏".to_string()),
+        };
+
+        match slot.as_mut() {
+            // `cancel` already took the handle and killed the process.
+            None => break None,
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {}
+                Err(error) => {
+                    return PassOutcome::Failed(format!("等待 ffmpeg 结束失败: {error}"));
+                }
+            },
+        }
+
+        drop(slot);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    // Reap the finished handle from the slot.
+    if let Ok(mut slot) = session.child.lock() {
+        slot.take();
+    }
+
+    let stderr = stderr_reader
+        .map(|handle| handle.join().ok())
+        .flatten()
+        .unwrap_or_default();
+
+    if session.is_cancelled() {
+        return PassOutcome::Cancelled;
+    }
+
+    match status {
+        Some(status) if status.success() => PassOutcome::Done,
+        _ => {
+            // The toolbar status can only hold a one-line summary, so debug
+            // builds also dump the full transcript to the console.
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("--- ffmpeg 编码失败 (bitrate {bitrate_kbps}k) ---");
+                eprintln!("{}", String::from_utf8_lossy(&stderr));
+            }
+
+            PassOutcome::Failed(format!("ffmpeg 编码失败: {}", ffmpeg_error(&stderr)))
+        }
+    }
+}
+
+/// Command line for one pass. Video is re-encoded to the requested bitrate;
+/// audio is copied through untouched.
+///
+/// `-f mp4` matters: the temporary file ends in `.compress`, not `.mp4`, so
+/// without an explicit format ffmpeg has no extension to guess a muxer from.
+fn ffmpeg_args(input: &Path, output: &Path, bitrate_kbps: i64) -> Vec<String> {
+    vec![
+        "-y".to_string(),
+        "-i".to_string(),
+        input.to_string_lossy().into_owned(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "fast".to_string(),
+        "-b:v".to_string(),
+        format!("{bitrate_kbps}k"),
+        "-c:a".to_string(),
+        "copy".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        "-f".to_string(),
+        "mp4".to_string(),
+        output.to_string_lossy().into_owned(),
+    ]
+}
+
+/// Last non-empty line of ffmpeg's stderr, clipped to a readable length.
+fn ffmpeg_error(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let tail = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("未知错误");
+
+    tail.chars().take(120).collect()
 }
 
 /// Opens the clip with the shell's default handler for `.mp4`.

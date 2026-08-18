@@ -20,8 +20,9 @@ use windows::Win32::{
         COINIT_APARTMENTTHREADED,
     },
     UI::Shell::{
-        FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-        FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+        FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, IShellItem,
+        SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
+        SIGDN_FILESYSPATH,
     },
 };
 
@@ -77,6 +78,63 @@ unsafe fn show(current: &Path) -> Option<PathBuf> {
     let display = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
 
     // The shell allocated the string; free it either way.
+    let path = display.to_string().ok().map(PathBuf::from);
+    CoTaskMemFree(Some(display.0 as *const core::ffi::c_void));
+
+    path
+}
+
+/// Asks the user where to save a file, starting in `directory` and seeded
+/// with `suggested_name`.
+///
+/// Returns `None` when the dialog is cancelled or the shell refuses to open
+/// it. Same thread rules as [`pick_folder`].
+#[cfg(windows)]
+pub fn pick_save_file(directory: &Path, suggested_name: &str) -> Option<PathBuf> {
+    unsafe {
+        if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+            return None;
+        }
+
+        let picked = show_save(directory, suggested_name);
+
+        CoUninitialize();
+        picked
+    }
+}
+
+/// No shell dialog off Windows, where recording isn't supported anyway.
+#[cfg(not(windows))]
+pub fn pick_save_file(_directory: &Path, _suggested_name: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+unsafe fn show_save(directory: &Path, suggested_name: &str) -> Option<PathBuf> {
+    let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL).ok()?;
+
+    let _ = dialog.SetTitle(&HSTRING::from("保存压缩视频"));
+
+    // `SetDefaultExtension` only kicks in when the user types a name without
+    // an extension, so a bare name always lands as an MP4.
+    let _ = dialog.SetDefaultExtension(&HSTRING::from("mp4"));
+    let _ = dialog.SetFileName(&HSTRING::from(suggested_name));
+
+    // Open on the source clip's folder, which always exists.
+    let start = HSTRING::from(directory);
+    if let Ok(folder) =
+        SHCreateItemFromParsingName::<PCWSTR, _, IShellItem>(PCWSTR(start.as_ptr()), None)
+    {
+        let _ = dialog.SetFolder(&folder);
+    }
+
+    // Cancelling comes back as HRESULT_FROM_WIN32(ERROR_CANCELLED), so any
+    // error here means "no file chosen".
+    dialog.Show(HWND::default()).ok()?;
+
+    let item = dialog.GetResult().ok()?;
+    let display = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+
     let path = display.to_string().ok().map(PathBuf::from);
     CoTaskMemFree(Some(display.0 as *const core::ffi::c_void));
 
