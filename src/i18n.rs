@@ -173,6 +173,11 @@ fn build_bundle(language: Language) -> Bundle {
         language.code().parse().expect("valid language tag"),
     ]);
 
+    // Interpolated values are plain runs of Latin/CJK digits and names; the
+    // bidi isolation marks Fluent wraps them in (U+2068/U+2069) have no glyph
+    // in the UI font and show up as boxes around every substituted argument.
+    bundle.set_use_isolating(false);
+
     // A parse failure here means a typo in a shipped file, which is worth
     // failing fast over: silently dropping every translation would be worse.
     let resource =
